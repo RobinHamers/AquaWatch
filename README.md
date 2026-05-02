@@ -78,9 +78,20 @@ Spatial NDCI maps with severity badge, scale bar, and north arrow; before/during
 
 ## Example Output
 
-![Dashboard](outputs/maps/dashboard.png)
+### Dashboard
+![Dashboard](assets/dashboard.png)
 
-The dashboard shows the full 2023–2024 time series with alert triangles (yellow = LOW, orange = MEDIUM, red = HIGH), the 30-day rolling baseline band, and a monthly alert count chart.
+Full 2023–2024 time series with alert triangles (yellow = LOW, orange = MEDIUM, red = HIGH), the 30-day rolling baseline band, and a monthly alert count chart.
+
+### Peak Bloom Alert Map — 2023-08-17 (HIGH, z=8.47)
+![Alert map](assets/alert_2023-08-17_HIGH.png)
+
+Spatial NDCI distribution at peak bloom. Red pixels indicate elevated cyanobacteria index; the reservoir boundary is overlaid in dark grey.
+
+### Before / Peak / After Comparison — Summer 2024
+![Bloom comparison](assets/bloom_comparison.png)
+
+NDCI panels for 2024-08-06 (pre-bloom), 2024-08-21 (peak), and 2024-09-10 (recovery). Shared colour scale across all three panels.
 
 ---
 
