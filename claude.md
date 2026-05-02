@@ -30,6 +30,9 @@ python scripts/download_all.py
 
 # Weekend 2: compute indices for all processed scenes, build CSV + plot
 python scripts/build_timeseries.py
+
+# Weekend 3: run anomaly detection + generate alert CSV + JSON
+python scripts/run_alerts.py
 ```
 
 ## Pipeline Architecture
@@ -54,11 +57,14 @@ Each stage writes to its own subdirectory and is idempotent — already-present 
 - `src/preprocess.py` — SCL cloud masking, polygon clipping, 20m→10m resampling
 - `src/indices.py` — NDCI, NDWI, turbidity computation on clipped GeoTIFFs
 - `src/timeseries.py` — per-scene stats aggregation → DataFrame → CSV
-- `src/alerts.py` — rolling-baseline anomaly detection (Weekend 3)
+- `src/alerts.py` — rolling-baseline anomaly detection, `Alert` dataclass, `check_new_scene()` for operational use
 - `src/visualize.py` — map and chart generation (Weekend 4)
 - `scripts/test_pipeline.py` — Weekend 1 end-to-end test for 3 scenes
 - `scripts/download_all.py` — Weekend 2 bulk download for full date range (B08 included)
 - `scripts/build_timeseries.py` — Weekend 2 index computation + CSV + plot
+- `scripts/run_alerts.py` — Weekend 3 anomaly detection + alert CSV/JSON + validation
+- `scripts/generate_maps.py` — Weekend 4 spatial maps + dashboard + demo package
+- `run.py` — Weekend 4 CLI entry point (setup / download / process / indices / timeseries / alerts / maps / check / run-all)
 
 Scripts add `PROJECT_ROOT/src` to `sys.path` manually; there is no package install.
 
@@ -119,10 +125,38 @@ so its non-NaN pixels = all pixels inside the polygon. Band valid / SCL valid = 
 CDSE can issue cross-domain redirects during download — follow them manually with `stream=True`
 from the initial request to preserve the `Authorization` header.
 
+## Alert Detection Calibration
+
+**Final thresholds (run_alerts.py):**
+- Absolute: LOW > 0.2, MEDIUM > 0.3, HIGH > 0.4 (standard NDCI thresholds — not reached in current dataset)
+- Z-score: threshold = **1.5σ** (calibrated down from 2.0 due to low variance in NDCI_water_mean)
+- Rolling window: 30 days, global-dataset fallback when < min_periods prior scenes
+
+**Validation results (38 scenes, 2023-08-12 → 2024-10-30):**
+- Summer 2023 bloom: LOW alert 2023-08-17 (z=1.70, global-baseline fallback — dataset starts too late for local context)
+- Summer 2024 bloom: MEDIUM alert 2024-08-21 (z=3.40) ✓
+- Total: 8 alerts (4 per year); 2/2 known bloom periods covered
+
+**Why NDCI_water values are low (-0.03 to +0.001):**
+The NDWI > 0 water mask passes only ~24% of polygon pixels (deepest open water). In drought years 2023–2024, the reservoir was at reduced capacity; the polygon includes large exposed shorelines with negative NDWI. Bloom-affected surface pixels may have altered spectral signatures that exclude them from the NDWI mask. Absolute thresholds of 0.2+ require unmasked or leniently-masked NDCI.
+
 ## Session Progress
 - [x] Weekend 1: Environment + data pipeline (download + clip + cloud mask)
 - [x] Weekend 2: Indices (NDCI, NDWI, turbidity), time series CSV + plot — run `download_all.py` then `build_timeseries.py` to populate outputs
-- [ ] Weekend 3: Anomaly detection + alert generation
-- [ ] Weekend 4: Visualization + CLI entry point + README
+- [x] Weekend 3: Anomaly detection + alert generation — run `run_alerts.py`; outputs at `outputs/alerts/serre_poncon_alerts.{csv,json}`
+- [x] Weekend 4: Visualization + CLI + README — `python run.py run-all --start 2023-04-01 --end 2024-10-31`; demo package at `outputs/demo/`
 
 **Weekend 2 done-marker:** `data/processed/{scene_id}/clipped/B08_clipped.tif` — presence means fully processed including B08 (needed for NDWI). The 3 Weekend 1 scenes lack B08; `download_all.py` will fill it in.
+
+## Known Limitations
+- **NDWI water mask too strict**: NDWI > 0 passes only ~24% of polygon pixels (deepest open water), excluding bloom-affected surface pixels. Use NDWI > −0.2 for better bloom sensitivity.
+- **Dataset starts Aug 2023**: Download timed out at 41 scenes; April–July 2023 data not available. This weakens the Summer 2023 detection (global baseline fallback used).
+- **Z-score false positives in winter**: Rolling baseline drift between summer and winter can produce z > 1.5 on non-bloom dates. A seasonal baseline or summer-only detection window would reduce these.
+- **No field validation**: Alert severity labels (LOW/MEDIUM/HIGH) are based on NDCI thresholds from literature, not validated against in-situ measurements at Serre-Ponçon.
+
+## Weekend 5+ Ideas
+- Email/webhook notification when `check_new_scene()` fires
+- Loosen NDWI mask to −0.2 and recalibrate absolute thresholds
+- Multi-reservoir support (parameterise polygon + BBOX per site)
+- Sentinel-3 OLCI integration for 300 m / daily revisit
+- Serve outputs via lightweight FastAPI + Leaflet web dashboard

@@ -1,1 +1,273 @@
 """Map and chart generation — Weekend 4."""
+
+import logging
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import rasterio
+
+logger = logging.getLogger(__name__)
+
+SEVERITY_COLORS = {"LOW": "#FFC107", "MEDIUM": "#FF7043", "HIGH": "#D32F2F"}
+NDCI_VMIN, NDCI_VMAX = -0.05, 0.05
+
+
+def _add_scalebar(ax, x_span_m: float) -> None:
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    bar_m = round(x_span_m * 0.15 / 1000) * 1000
+    bar_m = max(bar_m, 500)
+    x0 = xlim[0] + 0.05 * (xlim[1] - xlim[0])
+    y0 = ylim[0] + 0.05 * (ylim[1] - ylim[0])
+    dy = (ylim[1] - ylim[0]) * 0.012
+    ax.plot([x0, x0 + bar_m], [y0, y0], color="black", lw=3, solid_capstyle="butt", zorder=6)
+    ax.text(x0 + bar_m / 2, y0 + dy, f"{bar_m//1000:.0f} km", ha="center", va="bottom",
+            fontsize=8, zorder=6)
+
+
+def _add_north_arrow(ax) -> None:
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    x = xlim[1] - 0.07 * (xlim[1] - xlim[0])
+    y_tail = ylim[1] - 0.12 * (ylim[1] - ylim[0])
+    y_head = ylim[1] - 0.05 * (ylim[1] - ylim[0])
+    ax.annotate(
+        "N", xy=(x, y_head), xytext=(x, y_tail),
+        arrowprops=dict(arrowstyle="-|>", color="black", lw=1.5),
+        ha="center", va="center", fontsize=9, fontweight="bold", zorder=6,
+    )
+
+
+def plot_alert_map(
+    alert,
+    ndci_path: Path,
+    reservoir_geojson: Path,
+    output_path: Path,
+) -> Path:
+    """Generate a spatial NDCI map for one alert event.
+
+    Shows NDCI raster with diverging colormap, reservoir boundary,
+    severity badge, scale bar, north arrow, and colorbar.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(ndci_path) as src:
+        ndci = src.read(1, masked=True).astype(np.float32)
+        bounds = src.bounds
+        raster_crs = src.crs
+
+    gdf = gpd.read_file(reservoir_geojson).to_crs(raster_crs)
+
+    ndci_display = np.where(ndci.mask, np.nan, ndci.data)
+    extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    img = ax.imshow(ndci_display, cmap="RdBu_r", vmin=NDCI_VMIN, vmax=NDCI_VMAX,
+                    extent=extent, origin="upper", interpolation="nearest")
+    gdf.boundary.plot(ax=ax, color="#222222", linewidth=1.5, zorder=5)
+
+    cbar = plt.colorbar(img, ax=ax, shrink=0.72, pad=0.02)
+    cbar.set_label("NDCI (Cyanobacteria Index)", fontsize=10)
+    cbar.ax.tick_params(labelsize=8)
+
+    badge_color = SEVERITY_COLORS.get(alert.severity, "#888888")
+    badge = mpatches.FancyBboxPatch(
+        (0.02, 0.915), 0.22, 0.065, transform=ax.transAxes,
+        boxstyle="round,pad=0.01", facecolor=badge_color,
+        edgecolor="white", linewidth=1.5, zorder=10,
+    )
+    ax.add_patch(badge)
+    ax.text(0.13, 0.948, alert.severity, transform=ax.transAxes,
+            ha="center", va="center", fontsize=11, fontweight="bold",
+            color="white", zorder=11)
+
+    ax.set_title(
+        f"AquaWatch — Serre-Ponçon  |  {alert.date}  |  "
+        f"NDCI={alert.ndci_mean:.4f}  z={alert.z_score:.2f}",
+        fontsize=11, pad=8,
+    )
+    ax.set_xlabel("Easting (m)", fontsize=9)
+    ax.set_ylabel("Northing (m)", fontsize=9)
+    ax.tick_params(labelsize=8)
+
+    _add_scalebar(ax, bounds.right - bounds.left)
+    _add_north_arrow(ax)
+
+    plt.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved alert map → %s", output_path)
+    return output_path
+
+
+def plot_bloom_comparison(
+    dates: list,
+    ndci_paths: list[Path],
+    reservoir_geojson: Path,
+    output_path: Path,
+    title: str = "Bloom Event Progression",
+) -> Path:
+    """Multi-panel NDCI map for a sequence of dates (before/during/after)."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n = len(dates)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 6), constrained_layout=True)
+    if n == 1:
+        axes = [axes]
+
+    fig.suptitle(title, fontsize=13)
+    last_img = None
+
+    for i, (d, path, ax) in enumerate(zip(dates, ndci_paths, axes)):
+        with rasterio.open(path) as src:
+            ndci = src.read(1, masked=True).astype(np.float32)
+            bounds = src.bounds
+            raster_crs = src.crs
+
+        gdf = gpd.read_file(reservoir_geojson).to_crs(raster_crs)
+        ndci_display = np.where(ndci.mask, np.nan, ndci.data)
+        extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
+
+        img = ax.imshow(ndci_display, cmap="RdBu_r", vmin=NDCI_VMIN, vmax=NDCI_VMAX,
+                        extent=extent, origin="upper", interpolation="nearest")
+        gdf.boundary.plot(ax=ax, color="#222222", linewidth=1.2)
+
+        # Mean NDCI for subtitle
+        valid = ndci_display[np.isfinite(ndci_display)]
+        subtitle = f"{d}"
+        if valid.size > 0:
+            subtitle += f"\nNDCI={valid.mean():.4f}"
+        ax.set_title(subtitle, fontsize=10)
+        ax.tick_params(labelsize=7)
+        ax.set_xlabel("Easting (m)", fontsize=8)
+        if i == 0:
+            ax.set_ylabel("Northing (m)", fontsize=8)
+        else:
+            ax.set_yticklabels([])
+        last_img = img
+
+    if last_img is not None:
+        cbar = fig.colorbar(last_img, ax=axes, shrink=0.75, location="right")
+        cbar.set_label("NDCI", fontsize=10)
+
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved bloom comparison → %s", output_path)
+    return output_path
+
+
+def plot_dashboard(
+    df: pd.DataFrame,
+    alerts: list,
+    output_path: Path,
+) -> Path:
+    """Single-page AquaWatch dashboard PNG.
+
+    Layout: left column = NDCI + turbidity time series (top/bottom),
+    right column = monthly alert bar chart (full height).
+    """
+    from alerts import compute_rolling_baseline  # avoid module-level circular
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+
+    df_base = compute_rolling_baseline(df.set_index("date")).reset_index()
+
+    fig = plt.figure(figsize=(16, 10))
+    fig.suptitle(
+        "AquaWatch — Lac de Serre-Ponçon Water Quality Monitor",
+        fontsize=14, fontweight="bold", y=0.98,
+    )
+
+    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1],
+                           hspace=0.38, wspace=0.28)
+    ax_ndci = fig.add_subplot(gs[0, 0])
+    ax_turb = fig.add_subplot(gs[1, 0], sharex=ax_ndci)
+    ax_bar  = fig.add_subplot(gs[:, 1])
+
+    # ── NDCI time series ─────────────────────────────────────────────────────
+    bm = df_base["ndci_baseline_mean"]
+    bs = df_base["ndci_baseline_std"].fillna(0)
+    ax_ndci.fill_between(df_base["date"], bm - bs, bm + bs,
+                         alpha=0.15, color="#2166ac", label="±1σ baseline")
+    ax_ndci.plot(df_base["date"], bm, "--", color="#888888",
+                 linewidth=1.0, alpha=0.7, label="30-day baseline")
+    ax_ndci.plot(df["date"], df["ndci_water_mean"], "o-",
+                 color="#2166ac", linewidth=1.5, markersize=3, label="NDCI mean")
+
+    # Alert markers
+    plotted_sev = set()
+    for alert in sorted(alerts, key=lambda a: a.date):
+        color = SEVERITY_COLORS.get(alert.severity, "#888888")
+        match = df[df["date"].dt.date == alert.date]
+        y_val = match["ndci_water_mean"].iloc[0] if not match.empty else None
+        if y_val is not None:
+            lbl = alert.severity if alert.severity not in plotted_sev else "_"
+            ax_ndci.plot(pd.Timestamp(alert.date), y_val, "^", color=color,
+                         markersize=10, zorder=5, label=lbl)
+            plotted_sev.add(alert.severity)
+        ax_ndci.axvline(pd.Timestamp(alert.date), color=color,
+                        alpha=0.3, linewidth=1.0, linestyle=":")
+
+    ax_ndci.set_ylabel("NDCI (water pixels)", fontsize=9)
+    ax_ndci.legend(fontsize=7, ncol=4, loc="upper left")
+    ax_ndci.grid(axis="y", linestyle=":", alpha=0.4)
+    ax_ndci.set_title("NDCI Time Series with Alert Markers", fontsize=10)
+    plt.setp(ax_ndci.get_xticklabels(), visible=False)
+
+    # ── Turbidity time series ─────────────────────────────────────────────────
+    ax_turb.fill_between(df["date"],
+                         df["turbidity_water_p25"], df["turbidity_water_p75"],
+                         alpha=0.2, color="#762a83", label="IQR")
+    ax_turb.plot(df["date"], df["turbidity_water_mean"], "o-",
+                 color="#762a83", linewidth=1.5, markersize=3, label="Turbidity mean")
+    ax_turb.set_ylabel("Turbidity (B04/B03)", fontsize=9)
+    ax_turb.set_title("Turbidity Time Series", fontsize=10)
+    ax_turb.legend(fontsize=7, loc="upper left")
+    ax_turb.grid(axis="y", linestyle=":", alpha=0.4)
+    ax_turb.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax_turb.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    fig.autofmt_xdate(rotation=30)
+
+    # ── Monthly alert bar chart ───────────────────────────────────────────────
+    sev_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+    alert_months = pd.to_datetime([str(a.date) for a in alerts]).to_period("M")
+    month_counts = {}
+    month_worst = {}
+    for a, m in zip(alerts, alert_months):
+        month_counts[m] = month_counts.get(m, 0) + 1
+        if m not in month_worst or sev_rank[a.severity] > sev_rank[month_worst[m]]:
+            month_worst[m] = a.severity
+
+    if month_counts:
+        sorted_months = sorted(month_counts)
+        labels = [str(m) for m in sorted_months]
+        counts = [month_counts[m] for m in sorted_months]
+        colors = [SEVERITY_COLORS[month_worst[m]] for m in sorted_months]
+        ax_bar.barh(range(len(sorted_months)), counts, color=colors,
+                    edgecolor="white", height=0.7)
+        ax_bar.set_yticks(range(len(sorted_months)))
+        ax_bar.set_yticklabels(labels, fontsize=8)
+        ax_bar.set_xlabel("Alert count", fontsize=9)
+        ax_bar.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        ax_bar.grid(axis="x", linestyle=":", alpha=0.4)
+
+    ax_bar.set_title("Alerts by Month", fontsize=10)
+    patches = [mpatches.Patch(color=c, label=s) for s, c in SEVERITY_COLORS.items()]
+    ax_bar.legend(handles=patches, fontsize=8, loc="lower right")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved dashboard → %s", output_path)
+    return output_path

@@ -112,7 +112,7 @@ def apply_water_mask(
     index_path: Path,
     ndwi_path: Path,
     output_path: Path,
-    ndwi_threshold: float = 0.0,
+    ndwi_threshold: float = -0.2,
 ) -> Path:
     """Mask index to water pixels only (NDWI > threshold).
 
