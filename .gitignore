@@ -1,0 +1,18 @@
+# Data and heavy outputs
+data/
+outputs/
+*.tif
+*.SAFE
+*.zip
+
+# Python/Conda
+__pycache__/
+*.py[cod]
+*.class
+venv/
+.env
+.DS_Store
+
+# Large IDE folders
+.vscode/
+.idea/
