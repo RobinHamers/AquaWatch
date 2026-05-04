@@ -333,6 +333,209 @@ def cmd_check(args) -> None:
     print()
 
 
+def cmd_s3_download(args) -> None:
+    """Search and download Sentinel-3 OLCI WFR scenes for a date range."""
+    from s3_download import search_sentinel3_olci, download_s3_scene
+    username, password = _require_env()
+
+    logger.info("Searching S3 OLCI %s → %s", args.start, args.end)
+    scenes = search_sentinel3_olci(
+        bbox=BBOX,
+        date_start=args.start,
+        date_end=args.end,
+        max_results=600,
+    )
+    if not scenes:
+        logger.error("No Sentinel-3 scenes found.")
+        sys.exit(1)
+
+    s3_raw = PROJECT_ROOT / "data" / "raw_s3"
+    to_dl = [s for s in scenes if not (s3_raw / s["Name"].replace(".SEN3", "")).exists()]
+    print(f"\nFound {len(scenes)} S3 scene(s) — {len(to_dl)} to download.\n")
+
+    for scene in to_dl:
+        scene_id = scene["Name"].replace(".SEN3", "")
+        try:
+            download_s3_scene(
+                scene=scene,
+                output_dir=s3_raw / scene_id,
+                username=username,
+                password=password,
+            )
+        except Exception:
+            logger.exception("S3 download failed for %s", scene_id)
+
+
+def cmd_s3_process(args) -> None:
+    """Apply WQSF mask, reproject, and clip all downloaded S3 scenes."""
+    from s3_download import _nc_to_geotiff
+    from s3_preprocess import apply_wqsf_mask, clip_s3_to_reservoir
+
+    try:
+        from netCDF4 import Dataset as NC4Dataset
+    except ImportError:
+        logger.error(
+            "netCDF4 is required for S3 processing. "
+            "Install with: conda install -c conda-forge netcdf4"
+        )
+        sys.exit(1)
+
+    s3_raw      = PROJECT_ROOT / "data" / "raw_s3"
+    s3_proc     = PROJECT_ROOT / "data" / "processed_s3"
+    scene_dirs  = [d for d in s3_raw.iterdir() if d.is_dir()] if s3_raw.exists() else []
+    print(f"{len(scene_dirs)} raw S3 scene(s) to process.\n")
+
+    for scene_dir in scene_dirs:
+        geo_nc = scene_dir / "geo_coordinates.nc"
+        if not geo_nc.exists():
+            logger.warning("%s missing geo_coordinates.nc — skipping", scene_dir.name)
+            continue
+
+        with NC4Dataset(geo_nc) as ds:
+            lat = ds["latitude"][:]
+            lon = ds["longitude"][:]
+
+        bands = {"Oa08_reflectance": scene_dir / "Oa08_reflectance.nc",
+                 "Oa11_reflectance": scene_dir / "Oa11_reflectance.nc"}
+        wqsf_nc = scene_dir / "WQSF.nc"
+
+        tif_dir = s3_proc / scene_dir.name / "tif"
+        tif_dir.mkdir(parents=True, exist_ok=True)
+
+        band_tifs: dict[str, Path] = {}
+        for band_name, nc_path in bands.items():
+            if not nc_path.exists():
+                continue
+            out_tif = tif_dir / f"{band_name}.tif"
+            _nc_to_geotiff(nc_path, band_name, lat, lon, out_tif)
+            band_tifs[band_name] = out_tif
+
+        # Reproject WQSF the same way (uint32 — don't scale)
+        if wqsf_nc.exists():
+            wqsf_tif = tif_dir / "WQSF.tif"
+            if not wqsf_tif.exists():
+                _nc_to_geotiff(wqsf_nc, "WQSF", lat, lon, wqsf_tif)
+
+            masked = apply_wqsf_mask(
+                band_paths=band_tifs,
+                wqsf_path=tif_dir / "WQSF.tif",
+                output_dir=s3_proc / scene_dir.name / "masked",
+            )
+            clip_s3_to_reservoir(
+                band_paths=masked,
+                reservoir_geojson=RESERVOIR_GJ,
+                output_dir=s3_proc / scene_dir.name / "clipped",
+            )
+        logger.info("Processed S3 %s", scene_dir.name[:50])
+
+
+def cmd_s3_timeseries(args) -> None:
+    """Build S3 NDCI time series CSV from all processed S3 scenes."""
+    from indices import compute_s3_ndci
+    import rasterio
+
+    s3_proc  = PROJECT_ROOT / "data" / "processed_s3"
+    out_csv  = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_s3_wqi.csv"
+
+    if not s3_proc.exists():
+        logger.error("No processed S3 scenes found. Run s3-process first.")
+        sys.exit(1)
+
+    rows = []
+    for scene_dir in sorted(s3_proc.iterdir()):
+        clipped = scene_dir / "clipped"
+        oa11 = clipped / "Oa11_reflectance_clipped.tif"
+        oa08 = clipped / "Oa08_reflectance_clipped.tif"
+        if not oa11.exists() or not oa08.exists():
+            continue
+
+        parts = scene_dir.name.split("_")
+        sensing_dt = parts[7] if len(parts) > 7 else parts[-1]
+        scene_date = f"{sensing_dt[:4]}-{sensing_dt[4:6]}-{sensing_dt[6:8]}"
+
+        ndci_path = scene_dir / "indices" / "ndci_s3.tif"
+        ndci_path.parent.mkdir(parents=True, exist_ok=True)
+        compute_s3_ndci(oa11, oa08, ndci_path)
+
+        with rasterio.open(ndci_path) as src:
+            data = src.read(1, masked=True).astype("float32")
+        valid = data.compressed()
+        valid = valid[np.isfinite(valid)]
+        if valid.size == 0:
+            continue
+
+        rows.append({
+            "date": scene_date,
+            "scene_id": scene_dir.name,
+            "ndci_water_mean":   float(np.mean(valid)),
+            "ndci_water_median": float(np.median(valid)),
+            "ndci_water_std":    float(np.std(valid)),
+            "ndci_water_p10":    float(np.percentile(valid, 10)),
+            "ndci_water_p90":    float(np.percentile(valid, 90)),
+            "ndci_water_n":      int(valid.size),
+        })
+
+    if not rows:
+        logger.error("No S3 scenes produced valid NDCI stats.")
+        sys.exit(1)
+
+    import numpy as np
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"\nS3 time series: {len(df)} scenes → {out_csv.relative_to(PROJECT_ROOT)}")
+
+
+def cmd_fusion(args) -> None:
+    """Run S2/S3 fusion analysis and generate fused dashboard."""
+    import pandas as pd
+    from datetime import date as date_cls
+    from fusion import build_fused_timeseries, detect_s3_precursor_alerts, print_fusion_report
+    from visualize import plot_fused_dashboard
+    from alerts import compute_rolling_baseline, detect_alerts, flag_isolated_spikes, apply_seasonal_filter
+
+    s2_csv = TIMESERIES_CSV
+    s3_csv = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_s3_wqi.csv"
+
+    for path in (s2_csv, s3_csv):
+        if not path.exists():
+            logger.error("Missing: %s — run the relevant timeseries step first.", path)
+            sys.exit(1)
+
+    fused_csv = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_fused.csv"
+    fused_df  = build_fused_timeseries(s2_csv, s3_csv, fused_csv)
+
+    s2_df = pd.read_csv(s2_csv, parse_dates=["date"])
+    s3_df = pd.read_csv(s3_csv, parse_dates=["date"])
+
+    s2_idx = s2_df.set_index("date").sort_index()
+    s2_idx = compute_rolling_baseline(s2_idx)
+    alerts  = detect_alerts(s2_idx, z_score_threshold=1.5)
+    alerts  = flag_isolated_spikes(alerts)
+    alerts  = apply_seasonal_filter(alerts)
+
+    bloom_periods = [
+        (date_cls(2023, 7, 1), date_cls(2023, 8, 31), "Jul–Aug 2023"),
+        (date_cls(2024, 6, 1), date_cls(2024, 8, 31), "Jun–Aug 2024"),
+    ]
+    events = detect_s3_precursor_alerts(fused_df, bloom_periods)
+    print_fusion_report(fused_df, events, len(s3_df), len(s2_df))
+
+    dash_path = MAPS_DIR / "dashboard_fused.png"
+    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    plot_fused_dashboard(
+        s2_df=s2_df,
+        s3_df=s3_df,
+        alerts=alerts,
+        precursor_events=events,
+        output_path=dash_path,
+    )
+    print(f"Fused dashboard → {dash_path.relative_to(PROJECT_ROOT)}")
+
+
 def cmd_run_all(args) -> None:
     """Run the full pipeline end to end."""
     print("=== AquaWatch — Full Pipeline ===\n")
@@ -386,19 +589,26 @@ Examples:
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sub.add_parser("setup",      help="Create directory structure and validate credentials")
-    sub.add_parser("process",    help="Cloud-mask and clip all downloaded raw scenes")
-    sub.add_parser("indices",    help="Compute NDCI / NDWI / turbidity index rasters")
-    sub.add_parser("timeseries", help="Aggregate scene statistics into a time series CSV")
-    sub.add_parser("alerts",     help="Run anomaly detection and generate alert log")
-    sub.add_parser("maps",       help="Generate spatial maps for all alerts")
-    sub.add_parser("dashboard",  help="Generate summary dashboard PNG")
+    sub.add_parser("setup",        help="Create directory structure and validate credentials")
+    sub.add_parser("process",      help="Cloud-mask and clip all downloaded S2 raw scenes")
+    sub.add_parser("indices",      help="Compute NDCI / NDWI / turbidity index rasters")
+    sub.add_parser("timeseries",   help="Aggregate S2 scene statistics into a time series CSV")
+    sub.add_parser("alerts",       help="Run anomaly detection and generate alert log")
+    sub.add_parser("maps",         help="Generate spatial maps for all alerts")
+    sub.add_parser("dashboard",    help="Generate summary dashboard PNG")
+    sub.add_parser("s3-process",   help="WQSF-mask, reproject, and clip downloaded S3 scenes")
+    sub.add_parser("s3-timeseries",help="Build S3 NDCI time series CSV")
+    sub.add_parser("fusion",       help="Run S2/S3 fusion analysis and generate fused dashboard")
 
-    dl = sub.add_parser("download", help="Download Sentinel-2 scenes for a date range")
+    dl = sub.add_parser("download",    help="Download Sentinel-2 scenes for a date range")
     dl.add_argument("--start", required=True, metavar="YYYY-MM-DD", help="Start date")
     dl.add_argument("--end",   required=True, metavar="YYYY-MM-DD", help="End date")
 
-    ra = sub.add_parser("run-all", help="Run full pipeline end to end")
+    s3dl = sub.add_parser("s3-download", help="Download Sentinel-3 OLCI WFR scenes for a date range")
+    s3dl.add_argument("--start", required=True, metavar="YYYY-MM-DD")
+    s3dl.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
+
+    ra = sub.add_parser("run-all", help="Run full S2 pipeline end to end")
     ra.add_argument("--start", required=True, metavar="YYYY-MM-DD")
     ra.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
 
@@ -415,16 +625,20 @@ def main() -> None:
     args = parser.parse_args()
 
     dispatch = {
-        "setup":      cmd_setup,
-        "download":   cmd_download,
-        "process":    cmd_process,
-        "indices":    cmd_indices,
-        "timeseries": cmd_timeseries,
-        "alerts":     cmd_alerts,
-        "maps":       cmd_maps,
-        "dashboard":  cmd_dashboard,
-        "check":      cmd_check,
-        "run-all":    cmd_run_all,
+        "setup":         cmd_setup,
+        "download":      cmd_download,
+        "process":       cmd_process,
+        "indices":       cmd_indices,
+        "timeseries":    cmd_timeseries,
+        "alerts":        cmd_alerts,
+        "maps":          cmd_maps,
+        "dashboard":     cmd_dashboard,
+        "check":         cmd_check,
+        "run-all":       cmd_run_all,
+        "s3-download":   cmd_s3_download,
+        "s3-process":    cmd_s3_process,
+        "s3-timeseries": cmd_s3_timeseries,
+        "fusion":        cmd_fusion,
     }
 
     if args.command not in dispatch:

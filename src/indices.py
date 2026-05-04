@@ -146,6 +146,35 @@ def apply_water_mask(
     return output_path
 
 
+def compute_s3_ndci(
+    oa11_path: Path,
+    oa08_path: Path,
+    output_path: Path,
+) -> Path:
+    """Compute NDCI from Sentinel-3 OLCI bands.
+
+    NDCI_S3 = (Oa11 − Oa08) / (Oa11 + Oa08)
+    Oa11 = 709 nm (red edge), Oa08 = 665 nm (red).
+
+    S3 WFR products are already in reflectance (0.0–1.0); reads with scale=False.
+    """
+    if output_path.exists():
+        logger.debug("S3 NDCI already exists: %s", output_path.name)
+        return output_path
+
+    oa11, profile = _read_band(oa11_path, scale=False)
+    oa08, _       = _read_band(oa08_path, scale=False)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        denom = oa11 + oa08
+        ndci  = np.where(denom != 0, (oa11 - oa08) / denom, np.nan)
+
+    ndci = np.where(np.isnan(oa11) | np.isnan(oa08), np.nan, ndci)
+    _write_index(ndci.astype(np.float32), profile, output_path)
+    logger.info("Computed S3 NDCI → %s", output_path.name)
+    return output_path
+
+
 def compute_all_indices(
     band_paths: dict[str, Path],
     output_dir: Path,

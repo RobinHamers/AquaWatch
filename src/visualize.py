@@ -272,3 +272,145 @@ def plot_dashboard(
     plt.close(fig)
     logger.info("Saved dashboard → %s", output_path)
     return output_path
+
+
+def plot_fused_dashboard(
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    alerts: list,
+    precursor_events: list,
+    output_path: Path,
+) -> Path:
+    """S2 + S3 fusion dashboard PNG.
+
+    Layout:
+    - Top panel  : NDCI time series (S2 blue, S3 green, alert markers, precursor markers)
+    - Middle panel: S3 daily coverage (available/missing as a rug plot)
+    - Bottom panel: S2 turbidity with alert severity annotations
+
+    Parameters
+    ----------
+    s2_df : S2 timeseries DataFrame
+    s3_df : S3 timeseries DataFrame
+    alerts : list of Alert objects from S2 detection
+    precursor_events : list of PrecursorEvent from fusion.detect_s3_precursor_alerts()
+    output_path : destination PNG path
+    """
+    from alerts import compute_rolling_baseline  # avoid circular import
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    s2 = s2_df.copy()
+    s3 = s3_df.copy()
+    s2["date"] = pd.to_datetime(s2["date"])
+    s3["date"] = pd.to_datetime(s3["date"])
+    s2 = s2.sort_values("date")
+    s3 = s3.sort_values("date")
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 1, 2]})
+    fig.suptitle(
+        "AquaWatch — S2 × S3 Fusion Dashboard  |  Lac de Serre-Ponçon",
+        fontsize=14, fontweight="bold", y=0.99,
+    )
+
+    ax_ndci, ax_cov, ax_turb = axes
+
+    # ── Panel 1: NDCI time series ─────────────────────────────────────────────
+    s2_base = compute_rolling_baseline(s2.set_index("date")).reset_index()
+    bm = s2_base["ndci_baseline_mean"]
+    bs = s2_base["ndci_baseline_std"].fillna(0)
+    ax_ndci.fill_between(s2_base["date"], bm - bs, bm + bs,
+                         alpha=0.12, color="#2166ac", label="S2 ±1σ baseline")
+
+    # S2 NDCI
+    ax_ndci.plot(s2["date"], s2["ndci_water_mean"], "o-",
+                 color="#2166ac", linewidth=1.5, markersize=4, label="S2 NDCI (10 m)")
+
+    # S3 NDCI
+    ax_ndci.plot(s3["date"], s3["ndci_water_mean"], ".",
+                 color="#1a9641", linewidth=0, markersize=3, alpha=0.7, label="S3 NDCI (300 m)")
+    s3_smooth = s3.set_index("date")["ndci_water_mean"].rolling("7D").mean()
+    ax_ndci.plot(s3_smooth.index, s3_smooth.values, "-",
+                 color="#1a9641", linewidth=1.2, alpha=0.8, label="S3 7-day rolling mean")
+
+    # S2 alert markers
+    plotted_sev: set[str] = set()
+    for alert in sorted(alerts, key=lambda a: a.date):
+        color = SEVERITY_COLORS.get(alert.severity, "#888888")
+        match = s2[s2["date"].dt.date == alert.date]
+        y_val = match["ndci_water_mean"].iloc[0] if not match.empty else None
+        if y_val is not None:
+            lbl = f"S2 {alert.severity}" if alert.severity not in plotted_sev else "_"
+            ax_ndci.plot(pd.Timestamp(alert.date), y_val, "^",
+                         color=color, markersize=10, zorder=6, label=lbl)
+            plotted_sev.add(alert.severity)
+
+    # S3 precursor markers — star at first S3 detection
+    for ev in precursor_events:
+        if ev.s3_first_date is None:
+            continue
+        s3_match = s3[s3["date"].dt.date == ev.s3_first_date]
+        y_s3 = s3_match["ndci_water_mean"].iloc[0] if not s3_match.empty else NDCI_LOW
+        ax_ndci.plot(pd.Timestamp(ev.s3_first_date), y_s3, "*",
+                     color="#1a9641", markersize=14, zorder=7,
+                     label=f"S3 precursor ({ev.bloom_label})")
+        if ev.precursor_days and ev.precursor_days > 0:
+            ax_ndci.annotate(
+                f"−{ev.precursor_days}d",
+                xy=(pd.Timestamp(ev.s3_first_date), y_s3),
+                xytext=(10, 12), textcoords="offset points",
+                fontsize=8, color="#1a9641", fontweight="bold",
+            )
+
+    # Threshold lines
+    NDCI_LOW_V, NDCI_MED_V, NDCI_HIGH_V = 0.2, 0.3, 0.4
+    ax_ndci.axhline(NDCI_LOW_V,  color="#fdae61", linewidth=1.0, linestyle="--", alpha=0.8)
+    ax_ndci.axhline(NDCI_MED_V,  color="#f46d43", linewidth=1.0, linestyle="--", alpha=0.8)
+    ax_ndci.axhline(NDCI_HIGH_V, color="#d73027", linewidth=1.0, linestyle="--", alpha=0.8)
+
+    ax_ndci.set_ylabel("NDCI", fontsize=9)
+    ax_ndci.legend(fontsize=7, ncol=4, loc="upper left")
+    ax_ndci.grid(axis="y", linestyle=":", alpha=0.4)
+    ax_ndci.set_title("NDCI Time Series — S2 (blue) vs S3 (green)", fontsize=10)
+
+    # Summer shading on all panels
+    for year in (2023, 2024):
+        for ax in axes:
+            ax.axvspan(pd.Timestamp(f"{year}-06-01"), pd.Timestamp(f"{year}-09-30"),
+                       alpha=0.06, color="orange")
+
+    # ── Panel 2: S3 daily coverage ────────────────────────────────────────────
+    s3_dates = s3["date"]
+    ax_cov.eventplot(
+        [mdates.date2num(d) for d in s3_dates],
+        orientation="horizontal", lineoffsets=0.5, linelengths=0.9,
+        linewidths=0.8, color="#1a9641", alpha=0.6,
+    )
+    ax_cov.set_ylabel("S3\ndays", fontsize=8)
+    ax_cov.set_yticks([])
+    ax_cov.set_title("S3 Daily Coverage (clear-sky scenes)", fontsize=9)
+    ax_cov.grid(False)
+
+    # ── Panel 3: S2 turbidity ─────────────────────────────────────────────────
+    if "turbidity_water_mean" in s2.columns:
+        ax_turb.fill_between(s2["date"],
+                             s2.get("turbidity_water_p25", np.nan),
+                             s2.get("turbidity_water_p75", np.nan),
+                             alpha=0.2, color="#762a83", label="IQR")
+        ax_turb.plot(s2["date"], s2["turbidity_water_mean"], "o-",
+                     color="#762a83", linewidth=1.5, markersize=3, label="S2 turbidity")
+    ax_turb.set_ylabel("Turbidity (B04/B03)", fontsize=9)
+    ax_turb.legend(fontsize=7, loc="upper left")
+    ax_turb.grid(axis="y", linestyle=":", alpha=0.4)
+    ax_turb.set_title("S2 Turbidity Time Series", fontsize=10)
+    ax_turb.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax_turb.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    fig.autofmt_xdate(rotation=30)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved fused dashboard → %s", output_path)
+    return output_path

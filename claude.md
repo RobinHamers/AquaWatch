@@ -33,21 +33,41 @@ python scripts/build_timeseries.py
 
 # Weekend 3: run anomaly detection + generate alert CSV + JSON
 python scripts/run_alerts.py
+
+# Weekend 5: simulate S3 fusion (no real data needed)
+python scripts/simulate_s3_reprocess.py   # requires simulate_reprocess.py to have run first
+
+# Weekend 5: CLI commands for real S3 data (requires netCDF4 + CDSE credentials)
+python run.py s3-download --start 2023-04-01 --end 2024-10-31
+python run.py s3-process
+python run.py s3-timeseries
+python run.py fusion
 ```
 
 ## Pipeline Architecture
 
-Data flows in one direction through five stages:
-
+### Sentinel-2 (primary: 10m spatial, 5-day revisit)
 ```
 CDSE catalogue (search_sentinel2)
     → raw JP2 bands in data/raw/{scene_id}/
     → cloud-masked float32 GeoTIFFs in data/processed/{scene_id}/masked/
     → clipped + resampled GeoTIFFs in data/processed/{scene_id}/clipped/{BAND}_clipped.tif
     → index rasters in data/processed/{scene_id}/indices/
-    → aggregated stats → outputs/timeseries/serre_poncon_timeseries.csv
+    → aggregated stats → outputs/timeseries/serre_poncon_wqi.csv
     → alerts in outputs/alerts/
     → spatial maps in outputs/maps/
+```
+
+### Sentinel-3 OLCI (tripwire: 300m, daily revisit)
+```
+CDSE catalogue (search_sentinel3_olci)
+    → band NetCDF4 files in data/raw_s3/{scene_id}/ (Oa08, Oa11, WQSF, geo_coordinates)
+    → reprojected + WQSF-masked GeoTIFFs in data/processed_s3/{scene_id}/masked/
+    → clipped GeoTIFFs in data/processed_s3/{scene_id}/clipped/
+    → NDCI raster in data/processed_s3/{scene_id}/indices/ndci_s3.tif
+    → aggregated stats → outputs/timeseries/serre_poncon_s3_wqi.csv
+    → fused with S2 → outputs/timeseries/serre_poncon_fused.csv
+    → fused dashboard → outputs/maps/dashboard_fused.png
 ```
 
 Each stage writes to its own subdirectory and is idempotent — already-present files are skipped.
@@ -55,16 +75,20 @@ Each stage writes to its own subdirectory and is idempotent — already-present 
 **Key modules:**
 - `src/download.py` — CDSE OData Nodes() API: search + token auth + per-band streaming download
 - `src/preprocess.py` — SCL cloud masking, polygon clipping, 20m→10m resampling
-- `src/indices.py` — NDCI, NDWI, turbidity computation on clipped GeoTIFFs
+- `src/indices.py` — NDCI, NDWI, turbidity (S2) + `compute_s3_ndci()` (S3, scale=False)
 - `src/timeseries.py` — per-scene stats aggregation → DataFrame → CSV
 - `src/alerts.py` — rolling-baseline anomaly detection, `Alert` dataclass, `check_new_scene()` for operational use
-- `src/visualize.py` — map and chart generation (Weekend 4)
+- `src/visualize.py` — map and chart generation; `plot_fused_dashboard()` (Weekend 5)
+- `src/s3_download.py` — S3 OLCI WFR search + download + `_nc_to_geotiff()` (needs netCDF4)
+- `src/s3_preprocess.py` — WQSF masking, reservoir clipping for S3
+- `src/fusion.py` — `build_fused_timeseries()`, `detect_s3_precursor_alerts()`, `print_fusion_report()`
 - `scripts/test_pipeline.py` — Weekend 1 end-to-end test for 3 scenes
 - `scripts/download_all.py` — Weekend 2 bulk download for full date range (B08 included)
 - `scripts/build_timeseries.py` — Weekend 2 index computation + CSV + plot
 - `scripts/run_alerts.py` — Weekend 3 anomaly detection + alert CSV/JSON + validation
 - `scripts/generate_maps.py` — Weekend 4 spatial maps + dashboard + demo package
-- `run.py` — Weekend 4 CLI entry point (setup / download / process / indices / timeseries / alerts / maps / check / run-all)
+- `scripts/simulate_s3_reprocess.py` — Weekend 5 synthetic S3 simulation + fusion
+- `run.py` — CLI entry point (all commands including s3-download, s3-process, s3-timeseries, fusion)
 
 Scripts add `PROJECT_ROOT/src` to `sys.path` manually; there is no package install.
 
@@ -164,6 +188,7 @@ from the initial request to preserve the `Authorization` header.
 - [x] Weekend 4: Visualization + CLI + README — demo package at `outputs/demo/`
 - [x] Debug session 1: Fixed DN→reflectance scaling bug; recalibrated water mask threshold; added winter seasonal filter; revalidated against known bloom events; regenerated dashboard
 - [x] Debug session 2: Added min-pixel filter (40% of p75); spike isolation flag; broad seasonal filter (May–Oct bloom window); quality_flag column in timeseries CSV; false positive rate documented
+- [x] Weekend 5: Sentinel-3 OLCI integration — `src/s3_download.py`, `src/s3_preprocess.py`, `src/fusion.py`; `compute_s3_ndci()` in indices.py; `plot_fused_dashboard()` in visualize.py; simulate_s3_reprocess.py; fusion CLI commands; dashboard_fused.png
 
 **To reprocess after code changes:** delete `data/processed/*/indices/*.tif` then run:
 ```bash
@@ -202,9 +227,31 @@ If raw data is absent (gitignored), use `scripts/simulate_reprocess.py` to regen
   (INVALID_SCL_CLASSES includes 11). But edge-of-cloud/shadow pixels near class transitions can pass
   the mask and show ice-like spectral signatures.
 
-## Weekend 5+ Ideas
+## Sentinel-3 OLCI Integration (Weekend 5)
+
+**Product:** `S3_OL_2_WFR` (Water Full Resolution)
+**Resolution:** 300 m, ~daily revisit (Sentinel-3A + 3B)
+**Format:** NetCDF4 per band, irregular lat/lon swath grid → must reproject to UTM via `_nc_to_geotiff()`
+**Bands used:** Oa08 (665 nm Red) + Oa11 (709 nm Red Edge) → `compute_s3_ndci()` in `src/indices.py`
+**Already in reflectance:** S3 WFR values are pre-scaled; always read with `scale=False`
+**WQSF mask:** keep WATER (bit 1) and INLAND_WATER (bit 2), reject INVALID (bit 0), CLOUD (bit 25–27)
+
+**Fusion analysis results (simulation, 2023-04-01 → 2024-10-31):**
+- S3: 383 scenes (clear-sky), S2: 47 scenes
+- Co-observation agreement (|S3 − S2 NDCI| < 0.05): 97% of 30 joint scenes
+- Mean |S3 − S2| offset: 0.021 (S3 slightly lower due to 300m spatial averaging)
+- Jul–Aug 2023 bloom: S3 detected 6 days before S2 ✅ (S3 Aug 3 vs S2 Aug 9)
+- Jun–Aug 2024 bloom: S2 3 days before S3 (2024 bloom onset barely crossed LOW threshold)
+- Note: S3 NDCI values are ~15% lower than S2 (300m pixels average bloom with surrounding water)
+- `netCDF4` Python library required for real S3 data; not in current `environment.yml`
+
+**To use real S3 data:**
+1. Add `netcdf4` to `environment.yml`
+2. Run `python run.py s3-download --start 2023-04-01 --end 2024-10-31`
+3. Run `python run.py s3-process && python run.py s3-timeseries && python run.py fusion`
+
+## Weekend 6+ Ideas
 - Email/webhook notification when `check_new_scene()` fires
-- Loosen NDWI mask to −0.2 and recalibrate absolute thresholds
 - Multi-reservoir support (parameterise polygon + BBOX per site)
-- Sentinel-3 OLCI integration for 300 m / daily revisit
 - Serve outputs via lightweight FastAPI + Leaflet web dashboard
+- Loosen NDWI mask to −0.2 and recalibrate absolute thresholds (only if field data available)
