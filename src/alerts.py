@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -10,6 +10,13 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# Months considered within the cyanobacteria bloom season for Serre-Ponçon
+BLOOM_SEASON_MONTHS: frozenset[int] = frozenset([5, 6, 7, 8, 9, 10])
+
+# Minimum valid-pixel fraction relative to the 75th-percentile scene; scenes
+# below this threshold are too cloud-contaminated to produce reliable statistics.
+MIN_VALID_PIXEL_FRACTION = 0.4
 
 # CSV column names produced by timeseries.py
 _NDCI_MEAN = "ndci_water_mean"
@@ -118,12 +125,25 @@ def detect_alerts(
     if "ndci_baseline_mean" not in df.columns:
         df = compute_rolling_baseline(df)
 
+    # Typical pixel count: 75th percentile across all scenes.
+    # Scenes below MIN_VALID_PIXEL_FRACTION * typical are too cloud-contaminated.
+    typical_n = float(df[_NDCI_N].quantile(0.75)) if _NDCI_N in df.columns else 0.0
+    min_pixels = typical_n * MIN_VALID_PIXEL_FRACTION
+
     severity_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
     raw_alerts: list[Alert] = []
 
     for idx, row in df.iterrows():
         ndci_mean = row.get(_NDCI_MEAN, np.nan)
         if np.isnan(ndci_mean):
+            continue
+
+        n_valid = int(row.get(_NDCI_N, 0))
+        if typical_n > 0 and n_valid < min_pixels:
+            logger.info(
+                "Skipping %s: %d valid pixels < %.0f%% of typical (%.0f) — cloud contamination suspected",
+                idx, n_valid, MIN_VALID_PIXEL_FRACTION * 100, min_pixels,
+            )
             continue
 
         z = row.get("ndci_z_score", np.nan)
@@ -362,6 +382,56 @@ def print_validation_report(
     print(f"\nFalse positives outside bloom periods: {len(false_positives)}")
     print("=" * 50 + "\n")
     return all_pass
+
+
+def flag_isolated_spikes(
+    alerts: list[Alert],
+    window_days: int = 15,
+) -> list[Alert]:
+    """Flag HIGH/MEDIUM alerts with no neighbouring alert within window_days.
+
+    Does not remove the alert — preserves the data record — but appends
+    '[isolated_spike - low confidence]' to the notes field so downstream
+    consumers can filter or weight accordingly.
+    """
+    result = []
+    for i, alert in enumerate(alerts):
+        if alert.severity not in ("HIGH", "MEDIUM"):
+            result.append(alert)
+            continue
+        win_start = alert.date - timedelta(days=window_days)
+        win_end   = alert.date + timedelta(days=window_days)
+        has_neighbor = any(
+            j != i and win_start <= other.date <= win_end
+            for j, other in enumerate(alerts)
+        )
+        if not has_neighbor:
+            alert = replace(alert, notes=alert.notes + " [isolated_spike - low confidence]")
+        result.append(alert)
+    return result
+
+
+def apply_seasonal_filter(alerts: list[Alert]) -> list[Alert]:
+    """Downgrade alerts outside the bloom season (May–October).
+
+    For months Nov–Apr:
+      HIGH   → MEDIUM
+      MEDIUM → LOW
+    LOW alerts are left unchanged.
+    A note is appended so the reason is traceable; alerts are never suppressed.
+    """
+    result = []
+    for alert in alerts:
+        if alert.date.month not in BLOOM_SEASON_MONTHS:
+            new_sev = {"HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "LOW"}[alert.severity]
+            if new_sev != alert.severity:
+                alert = replace(
+                    alert,
+                    severity=new_sev,
+                    notes=alert.notes + " [outside_bloom_season - possible sediment or optical artifact]",
+                )
+        result.append(alert)
+    return result
 
 
 def check_new_scene(

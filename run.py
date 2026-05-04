@@ -210,6 +210,7 @@ def cmd_alerts(args) -> None:
     from alerts import (
         compute_rolling_baseline, detect_alerts, save_alerts,
         summarize_alerts, validate_against_known_events,
+        apply_seasonal_filter, flag_isolated_spikes, print_validation_report,
     )
     from datetime import date as date_cls
 
@@ -222,14 +223,16 @@ def cmd_alerts(args) -> None:
     df = compute_rolling_baseline(df)
 
     alerts = detect_alerts(df, z_score_threshold=1.5)
+    alerts = flag_isolated_spikes(alerts)    # flag while severity reflects absolute NDCI
+    alerts = apply_seasonal_filter(alerts)   # then downgrade off-season events
     save_alerts(alerts, PROJECT_ROOT / "outputs" / "alerts", "serre_poncon")
     summarize_alerts(alerts)
 
-    known = [
-        (date_cls(2023, 7, 1),  date_cls(2023, 8, 31),  "Summer 2023 bloom"),
-        (date_cls(2024, 6, 1),  date_cls(2024, 8, 31),  "Summer 2024 bloom"),
+    bloom_periods = [
+        (date_cls(2023, 7, 1), date_cls(2023, 8, 31), "Jul-Aug 2023"),
+        (date_cls(2024, 6, 1), date_cls(2024, 8, 31), "Jun-Aug 2024"),
     ]
-    validate_against_known_events(alerts, known)
+    print_validation_report(df, alerts, bloom_periods)
 
 
 def cmd_maps(args) -> None:

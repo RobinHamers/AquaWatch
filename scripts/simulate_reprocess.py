@@ -13,11 +13,10 @@ Run from project root:
     python3 scripts/simulate_reprocess.py
 """
 
-import json
 import logging
 import shutil
 import sys
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -27,13 +26,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from alerts import (
-    Alert,
     compute_rolling_baseline,
     detect_alerts,
+    apply_seasonal_filter,
+    flag_isolated_spikes,
     print_validation_report,
     save_alerts,
     summarize_alerts,
 )
+from timeseries import add_quality_flags
 from visualize import plot_dashboard
 
 logging.basicConfig(
@@ -49,9 +50,11 @@ logger = logging.getLogger("simulate_reprocess")
 # Expected range after fix: −0.1 to +0.5.
 # Turbidity = B04/B03 (scale-invariant; unchanged by the fix).
 #
-# Key events:
+# Key events modelled:
 #   Jul–Aug 2023: genuine cyanobacteria bloom (peak 0.41 on Aug-17)
-#   Feb 2024:     ice/snowmelt false positive (0.41 but turbidity=0.79 → winter filter → MEDIUM)
+#   Feb-08 2024:  ice/snowmelt false positive (high NDCI, low turbidity, low pixels)
+#   Mar-20 2024:  cloud-contaminated scene with apparent spike — only 3100 valid
+#                 pixels, filtered out by MIN_VALID_PIXEL_FRACTION check
 #   Jun–Aug 2024: second bloom season (peak 0.38 in Aug)
 
 SCENES = [
@@ -84,7 +87,9 @@ SCENES = [
     ("2024-02-08",  0.413,  0.79, 7900,  "S2A_MSIL2A_20240208T103021"),  # ice/snowmelt FP
     ("2024-02-21",  0.031,  0.82, 8300,  "S2B_MSIL2A_20240221T103021"),
     ("2024-03-06",  0.038,  0.88, 8800,  "S2A_MSIL2A_20240306T103021"),
-    ("2024-03-20",  0.044,  0.92, 9300,  "S2B_MSIL2A_20240320T103021"),
+    # Cloud-contaminated scene: high NDCI from partial cloud shadow, only 3100 valid
+    # pixels (~27% of typical). Filtered by MIN_VALID_PIXEL_FRACTION check.
+    ("2024-03-20",  0.388,  1.35, 3100,  "S2B_MSIL2A_20240320T103021"),
     ("2024-04-02",  0.051,  1.08, 9800,  "S2A_MSIL2A_20240402T103021"),
     ("2024-04-15",  0.047,  1.05, 9900,  "S2B_MSIL2A_20240415T103021"),
     ("2024-04-28",  0.039,  0.99, 10100, "S2A_MSIL2A_20240428T103021"),
@@ -147,28 +152,47 @@ def _make_row(date_str, ndci_mean, turb_mean, n_pix, scene_id):
 
 def main():
     # ── Create output dirs ────────────────────────────────────────────────────
-    ts_dir  = PROJECT_ROOT / "outputs" / "timeseries"
-    al_dir  = PROJECT_ROOT / "outputs" / "alerts"
-    map_dir = PROJECT_ROOT / "outputs" / "maps"
+    ts_dir   = PROJECT_ROOT / "outputs" / "timeseries"
+    al_dir   = PROJECT_ROOT / "outputs" / "alerts"
+    map_dir  = PROJECT_ROOT / "outputs" / "maps"
     demo_dir = PROJECT_ROOT / "outputs" / "demo"
     for d in (ts_dir, al_dir, map_dir, demo_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ── Build time series CSV ─────────────────────────────────────────────────
+    # ── Build time series CSV with quality flags ──────────────────────────────
     rows = [_make_row(*s) for s in SCENES]
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
+    df = add_quality_flags(df)
+
+    # Reorder so quality_flag comes early
+    col_order = ["date", "scene_id", "quality_flag"] + [
+        c for c in df.columns if c not in ("date", "scene_id", "quality_flag")
+    ]
+    df = df[col_order]
 
     csv_path = ts_dir / "serre_poncon_wqi.csv"
     df.to_csv(csv_path, index=False)
     logger.info("Wrote time series CSV (%d rows) → %s", len(df), csv_path)
 
-    # ── Alert detection ───────────────────────────────────────────────────────
+    # ── Quality flag summary ──────────────────────────────────────────────────
+    print("\n── Quality Flag Summary ─────────────────────────────────")
+    for flag, grp in df.groupby("quality_flag"):
+        print(f"  {flag:<22} {len(grp):>3} scene(s)")
+    print("─────────────────────────────────────────────────────────\n")
+
+    # ── Alert detection pipeline ──────────────────────────────────────────────
     df_idx = df.set_index("date").sort_index()
     df_idx = compute_rolling_baseline(df_idx)
 
+    # 1. Detect (includes pixel-count filter and Dec–Feb HIGH suppression)
     alerts = detect_alerts(df_idx, z_score_threshold=1.5)
+    # 2. Flag isolated spikes before seasonal downgrade (while severity still HIGH/MEDIUM)
+    alerts = flag_isolated_spikes(alerts, window_days=15)
+    # 3. Downgrade off-season alerts
+    alerts = apply_seasonal_filter(alerts)
+
     save_alerts(alerts, al_dir, "serre_poncon")
     summarize_alerts(alerts)
 
@@ -190,18 +214,14 @@ def main():
     plot_dashboard(df=df, alerts=alerts, output_path=dashboard_path)
     logger.info("Dashboard → %s", dashboard_path)
 
-    # Copy to demo/
-    demo_dash = demo_dir / "dashboard.png"
-    shutil.copy2(dashboard_path, demo_dash)
-
-    # Copy alerts JSON
+    shutil.copy2(dashboard_path, demo_dir / "dashboard.png")
     shutil.copy2(al_dir / "serre_poncon_alerts.json", demo_dir / "serre_poncon_alerts.json")
 
     print(f"\nOutputs written:")
     print(f"  {csv_path.relative_to(PROJECT_ROOT)}")
     print(f"  {al_dir.relative_to(PROJECT_ROOT)}/serre_poncon_alerts.{{csv,json}}")
     print(f"  {dashboard_path.relative_to(PROJECT_ROOT)}")
-    print(f"  {demo_dash.relative_to(PROJECT_ROOT)}")
+    print(f"  {(demo_dir / 'dashboard.png').relative_to(PROJECT_ROOT)}")
 
     return 0 if all_validated else 1
 

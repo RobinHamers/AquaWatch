@@ -13,6 +13,33 @@ logger = logging.getLogger(__name__)
 
 NDCI_ALERT_LOW = 0.2
 NDCI_ALERT_MEDIUM = 0.3
+
+# Months outside the bloom window (May–Oct) — scenes in these months warrant caution
+_WINTER_MONTHS = frozenset([11, 12, 1, 2, 3, 4])
+_MIN_PIXEL_FRACTION = 0.4  # fraction of p75 below which a scene is 'low_pixels'
+
+
+def add_quality_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a 'quality_flag' column based on pixel coverage and season.
+
+    Flags:
+      'good'              — ≥40% typical pixels and in bloom season (May–Oct)
+      'low_pixels'        — <40% typical pixels, bloom season
+      'winter'            — Nov–Apr, sufficient pixel coverage
+      'low_pixels_winter' — Nov–Apr AND low pixel coverage
+
+    The 'low_pixels' threshold is 40% of the 75th-percentile scene pixel count.
+    Intended as an audit trail column; alert detection uses the same threshold.
+    """
+    df = df.copy()
+    typical_n = float(df["ndci_water_n"].quantile(0.75))
+    low_px = df["ndci_water_n"] < typical_n * _MIN_PIXEL_FRACTION
+    winter = pd.to_datetime(df["date"]).dt.month.isin(_WINTER_MONTHS)
+
+    conditions = [low_px & winter, low_px & ~winter, ~low_px & winter]
+    choices    = ["low_pixels_winter", "low_pixels", "winter"]
+    df["quality_flag"] = np.select(conditions, choices, default="good")
+    return df
 NDCI_ALERT_HIGH = 0.4
 
 
@@ -136,7 +163,10 @@ def build_timeseries(
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    col_order = ["date", "scene_id"] + [c for c in df.columns if c not in ("date", "scene_id")]
+    df = add_quality_flags(df)
+    col_order = ["date", "scene_id", "quality_flag"] + [
+        c for c in df.columns if c not in ("date", "scene_id", "quality_flag")
+    ]
     df = df[col_order]
     df.to_csv(output_path, index=False)
     logger.info("Saved time series (%d rows) → %s", len(df), output_path)

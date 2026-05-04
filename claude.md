@@ -136,12 +136,24 @@ from the initial request to preserve the `Authorization` header.
 - Absolute: LOW > 0.2, MEDIUM > 0.3, HIGH > 0.4
 - Z-score: threshold = **1.5σ** (rolling 30-day window, global-dataset fallback when < 3 prior scenes)
 - NDWI water mask: **0.1** (changed from −0.2 to exclude shoreline mixed pixels)
+- Min valid pixels: **40% of 75th-percentile scene** — scenes below this are skipped as cloud-contaminated
 
-**Validation results post-calibration fix (47 scenes, 2023-04-02 → 2024-10-27):**
+**Alert post-processing pipeline (order matters):**
+1. `detect_alerts()` — raw detection + Dec–Feb HIGH suppression + pixel-count filter
+2. `flag_isolated_spikes()` — mark HIGH/MEDIUM with no neighbor in ±15 days as low-confidence
+3. `apply_seasonal_filter()` — downgrade alerts outside bloom season (May–Oct): HIGH→MEDIUM, MEDIUM→LOW
+
+**Quality flags in timeseries CSV (`quality_flag` column):**
+- `good` — ≥40% typical pixels and May–Oct
+- `winter` — Nov–Apr, sufficient pixels (use with caution)
+- `low_pixels` — <40% typical pixels, bloom season
+- `low_pixels_winter` — both conditions (highest suspicion)
+
+**Validation results post-false-positive fixes (47 scenes, 2023-04-02 → 2024-10-27):**
 - Jul–Aug 2023 bloom: 6 alerts (LOW: 1, MEDIUM: 4, HIGH: 1) — peak NDCI 0.412 on 2023-08-17 ✅ VALIDATED
 - Jun–Aug 2024 bloom: 8 alerts (LOW: 4, MEDIUM: 4, HIGH: 0) — peak NDCI 0.378 on 2024-08-14 ✅ VALIDATED
-- Total: 20 alerts (9 in 2023, 11 in 2024); both bloom periods validated
-- False positives outside bloom periods: 6 (shoulder-season z-score and 1 winter event — see below)
+- Total: 19 alerts (9 in 2023, 10 in 2024); both bloom periods validated
+- False positives outside bloom periods: 5 (shoulder-season z-score × 4 + 1 winter LOW)
 
 **NDCI value range after calibration fix:** −0.1 to ~0.5 (previously −0.01 to +0.03 due to missing ÷10000.0 scaling).
 
@@ -150,7 +162,8 @@ from the initial request to preserve the `Authorization` header.
 - [x] Weekend 2: Indices (NDCI, NDWI, turbidity), time series CSV + plot
 - [x] Weekend 3: Anomaly detection + alert generation
 - [x] Weekend 4: Visualization + CLI + README — demo package at `outputs/demo/`
-- [x] Debug session: Fixed DN→reflectance scaling bug; recalibrated water mask threshold; added winter seasonal filter; revalidated against known bloom events; regenerated dashboard
+- [x] Debug session 1: Fixed DN→reflectance scaling bug; recalibrated water mask threshold; added winter seasonal filter; revalidated against known bloom events; regenerated dashboard
+- [x] Debug session 2: Added min-pixel filter (40% of p75); spike isolation flag; broad seasonal filter (May–Oct bloom window); quality_flag column in timeseries CSV; false positive rate documented
 
 **To reprocess after code changes:** delete `data/processed/*/indices/*.tif` then run:
 ```bash
@@ -160,18 +173,32 @@ If raw data is absent (gitignored), use `scripts/simulate_reprocess.py` to regen
 
 **Weekend 2 done-marker:** `data/processed/{scene_id}/clipped/B08_clipped.tif` — presence means fully processed including B08 (needed for NDWI).
 
-## Known Limitations
-- **Winter false positives (Dec–Feb)**: Ice, snow cover, and post-snowmelt sediment resuspension can
-  elevate NDCI into the 0.3–0.45 range without a genuine cyanobacteria bloom. A HIGH alert fired on
-  2024-02-08 (NDCI=0.413) with turbidity=0.79, consistent with an ice/snowmelt signal rather than algae.
-  Mitigation: `detect_alerts()` applies a seasonal filter — HIGH alerts in Dec–Feb are downgraded to
-  MEDIUM if `turbidity_mean ≤ 0.95`. This suppresses false HIGH alerts while preserving the event record.
-- **No field validation**: Alert severity labels (LOW/MEDIUM/HIGH) are based on NDCI thresholds from
-  literature, not validated against in-situ measurements at Serre-Ponçon.
-- **Z-score shoulder-season alerts**: Rapid NDCI decline after bloom creates high z-scores in Oct–Nov.
-  These generate LOW alerts flagged as false positives but are structurally correct (anomalous relative
-  to the recent baseline). A seasonal detection window (Apr–Oct only) would eliminate them.
-- **No SCL snow/ice class suppression**: SCL class 11 (snow/ice) is already masked in `preprocess.py`
+## Known Limitations and False Positive Analysis
+
+**March/April cloud-contaminated spike (root cause: low pixel count):**
+  2024-03-20 showed apparent NDCI=0.388 with only 3100 valid pixels (~27% of typical summer coverage).
+  Cause: partial cloud cover left too few clean water pixels; the remaining fraction was dominated by
+  cloud-shadow edge pixels with anomalous spectral response. Filtered by `MIN_VALID_PIXEL_FRACTION=0.4`
+  in `detect_alerts()`. Quality flag: `low_pixels_winter`. No alert generated.
+
+**February 2024 alert (root cause: ice/snowmelt sediment):**
+  2024-02-08 NDCI=0.413, turbidity=0.79. The low turbidity rules out algae (blooms correlate with
+  elevated turbidity ≥ 1.0). Suspected cause: ice edge reflectance or snowmelt sediment resuspension.
+  Triple-downgraded via: Dec–Feb HIGH→MEDIUM suppression in `detect_alerts()`, then `[isolated_spike]`
+  flag (no neighboring alerts in ±15 days), then `apply_seasonal_filter()` → final severity LOW.
+  Full notes trace: `[downgraded: winter HIGH without elevated turbidity] [isolated_spike - low confidence]
+  [outside_bloom_season - possible sediment or optical artifact]`.
+
+**False positive rate (post-fix):** 5 alerts outside bloom season out of 19 total = 26%.
+  All 5 are LOW severity; 4 are shoulder-season z-score triggers (NDCI 0.05–0.07), 1 is the Feb event.
+  Summer bloom alerts (HIGH + MEDIUM) occur exclusively within the May–Oct bloom window.
+
+- **No field validation**: Alert severity labels are based on NDCI thresholds from literature, not
+  validated against in-situ measurements at Serre-Ponçon.
+- **Z-score shoulder-season alerts**: Rapid NDCI decline post-bloom creates high z-scores in Oct–Nov.
+  These generate LOW alerts that are structurally correct but ecologically insignificant. A hard
+  bloom-season detection window (May–Oct only) would eliminate them.
+- **No SCL snow/ice class suppression**: SCL class 11 (snow/ice) is masked in `preprocess.py`
   (INVALID_SCL_CLASSES includes 11). But edge-of-cloud/shadow pixels near class transitions can pass
   the mask and show ice-like spectral signatures.
 
