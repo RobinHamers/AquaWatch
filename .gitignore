@@ -1,5 +1,5 @@
 # Data and heavy outputs (raw satellite data + processed rasters)
-data/
+data/*
 !data/reservoir/
 outputs/
 *.tif

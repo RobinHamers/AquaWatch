@@ -13,9 +13,9 @@ RESERVOIRS: dict[str, dict] = {
     "serre_poncon": {
         "name":        "Lac de Serre-Ponçon",
         "country":     "France",
-        "geojson":     PROJECT_ROOT / "data" / "reservoir" / "serre_poncon.geojson",
+        "geojson":     PROJECT_ROOT / "data" / "reservoir" / "serre_poncon.gpkg",
         "epsg":        "EPSG:32631",
-        "bbox":        [6.28, 44.49, 6.45, 44.62],
+        "bbox":        [6.27, 44.46, 6.43, 44.54],
         "area_km2":    28,
         "known_blooms": [
             {"start": "2023-07-01", "end": "2023-08-31", "label": "Jul-Aug 2023",
@@ -27,9 +27,9 @@ RESERVOIRS: dict[str, dict] = {
     "entrepenhas": {
         "name":        "Embalse de Entrepeñas",
         "country":     "Spain",
-        "geojson":     PROJECT_ROOT / "data" / "reservoir" / "entrepenhas.geojson",
+        "geojson":     PROJECT_ROOT / "data" / "reservoir" / "entrepenhas.gpkg",
         "epsg":        "EPSG:32630",
-        "bbox":        [2.50, 40.46, 2.88, 40.64],
+        "bbox":        [-2.75, 40.49, -2.64, 40.66],
         "area_km2":    80,
         "known_blooms": [
             {"start": "2022-07-01", "end": "2022-09-30", "label": "Jul-Sep 2022",

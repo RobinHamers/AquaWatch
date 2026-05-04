@@ -1,9 +1,9 @@
 """Sentinel-3 OLCI WFR preprocessing: WQSF masking and reservoir clipping."""
 
-import json
 import logging
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.mask import mask as rio_mask
@@ -91,18 +91,12 @@ def clip_s3_to_reservoir(
     -------
     Dict of band name → clipped GeoTIFF path.
     """
-    import pyproj
-    from shapely.geometry import shape, mapping
-    from shapely.ops import transform as shapely_transform
+    from shapely.geometry import mapping
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(reservoir_geojson) as fh:
-        gj = json.load(fh)
-
-    features = gj["features"] if gj["type"] == "FeatureCollection" else [gj]
-    geoms_wgs84 = [shape(f["geometry"]) for f in features]
+    gdf_wgs84 = gpd.read_file(reservoir_geojson).to_crs("EPSG:4326")
 
     clipped_paths: dict[str, Path] = {}
     for band_name, band_path in band_paths.items():
@@ -115,10 +109,7 @@ def clip_s3_to_reservoir(
         with rasterio.open(band_path) as src:
             raster_crs = src.crs.to_string()
 
-        proj = pyproj.Transformer.from_crs(
-            "EPSG:4326", raster_crs, always_xy=True
-        ).transform
-        shapes = [mapping(shapely_transform(proj, g)) for g in geoms_wgs84]
+        shapes = [mapping(g) for g in gdf_wgs84.to_crs(raster_crs).geometry]
 
         with rasterio.open(band_path) as src:
             try:
