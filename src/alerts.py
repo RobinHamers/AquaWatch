@@ -112,6 +112,7 @@ def detect_alerts(
     absolute_threshold_medium: float = 0.3,
     absolute_threshold_high: float = 0.4,
     z_score_threshold: float = 2.0,
+    reservoir_name: str = "serre_poncon",
 ) -> list[Alert]:
     """Detect water quality anomalies using absolute NDCI thresholds and z-score.
 
@@ -177,7 +178,7 @@ def detect_alerts(
 
         alert = Alert(
             date=idx.date() if hasattr(idx, "date") else idx,
-            reservoir="serre_poncon",
+            reservoir=reservoir_name,
             severity=severity,
             ndci_mean=float(ndci_mean),
             ndci_p90=float(row.get(_NDCI_P90, np.nan)),
@@ -331,12 +332,13 @@ def print_validation_report(
     df: pd.DataFrame,
     alerts: list[Alert],
     bloom_periods: list[tuple[date, date, str]],
+    reservoir_name: str = "Serre-Ponçon",
 ) -> bool:
     """Print a structured validation report against known bloom periods.
 
     Returns True if all bloom periods have at least one MEDIUM/HIGH alert.
     """
-    print("\n=== AquaWatch Validation Report — Serre-Ponçon ===")
+    print(f"\n=== AquaWatch Validation Report — {reservoir_name} ===")
 
     if not isinstance(df.index, pd.DatetimeIndex):
         df = df.copy()

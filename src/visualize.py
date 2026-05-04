@@ -414,3 +414,112 @@ def plot_fused_dashboard(
     plt.close(fig)
     logger.info("Saved fused dashboard → %s", output_path)
     return output_path
+
+
+def plot_comparison_dashboard(
+    reservoirs: dict,
+    output_path: Path,
+) -> Path:
+    """Side-by-side multi-reservoir NDCI time series dashboard (Figure 1 for ES4S paper).
+
+    One row per reservoir. Each row shows the NDCI time series, rolling baseline,
+    alert markers, and known bloom period shading. Separate x-axes (periods differ).
+
+    Parameters
+    ----------
+    reservoirs : mapping of reservoir_key → dict with keys:
+                   timeseries (DataFrame), alerts (list[Alert]), config (dict)
+    output_path : destination PNG
+
+    Returns
+    -------
+    Path to saved PNG.
+    """
+    from alerts import compute_rolling_baseline
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    res_items = list(reservoirs.items())
+    n = len(res_items)
+
+    fig, axes = plt.subplots(n, 1, figsize=(16, 5 * n))
+    if n == 1:
+        axes = [axes]
+    fig.suptitle(
+        "AquaWatch — Multi-Reservoir Validation  |  Same thresholds, no retuning",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+
+    row_colors = ["#2166ac", "#d6604d", "#4dac26", "#762a83"]
+
+    for idx, (res_name, res_data) in enumerate(res_items):
+        ax  = axes[idx]
+        df  = res_data["timeseries"].copy()
+        al  = res_data["alerts"]
+        cfg = res_data["config"]
+        color = row_colors[idx % len(row_colors)]
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+
+        df_base = compute_rolling_baseline(df.set_index("date")).reset_index()
+        bm = df_base["ndci_baseline_mean"]
+        bs = df_base["ndci_baseline_std"].fillna(0)
+
+        ax.fill_between(df_base["date"], bm - bs, bm + bs,
+                        alpha=0.12, color=color, label="±1σ baseline")
+        ax.plot(df_base["date"], bm, "--", color="#888888",
+                linewidth=0.9, alpha=0.6, label="30-day baseline")
+        ax.plot(df["date"], df["ndci_water_mean"], "o-",
+                color=color, linewidth=1.5, markersize=3.5, label="NDCI mean")
+
+        # Bloom period shading
+        for bloom in cfg.get("known_blooms", []):
+            ax.axvspan(
+                pd.Timestamp(bloom["start"]), pd.Timestamp(bloom["end"]),
+                alpha=0.10, color="gold",
+                label=f"Known bloom ({bloom['label']})" if bloom == cfg["known_blooms"][0] else "_",
+            )
+
+        # Alert markers
+        plotted_sev: set[str] = set()
+        for alert in sorted(al, key=lambda a: a.date):
+            ac = SEVERITY_COLORS.get(alert.severity, "#888888")
+            match = df[df["date"].dt.date == alert.date]
+            y_val = match["ndci_water_mean"].iloc[0] if not match.empty else None
+            if y_val is not None:
+                lbl = alert.severity if alert.severity not in plotted_sev else "_"
+                ax.plot(pd.Timestamp(alert.date), y_val, "^",
+                        color=ac, markersize=9, zorder=6, label=lbl)
+                plotted_sev.add(alert.severity)
+
+        # Threshold lines (only labelled on first row)
+        for val, col, lab in [
+            (0.2, "#fdae61", "LOW (0.20)"),
+            (0.3, "#f46d43", "MED (0.30)"),
+            (0.4, "#d73027", "HIGH (0.40)"),
+        ]:
+            ax.axhline(val, color=col, linewidth=0.9, linestyle="--", alpha=0.8,
+                       label=lab if idx == 0 else "_")
+
+        country = cfg.get("country", "")
+        area    = cfg.get("area_km2", "?")
+        ax.set_title(
+            f"{cfg.get('name', res_name)}  [{country}  ·  {area} km²  ·  EPSG:{cfg.get('epsg','?').split(':')[-1]}]",
+            fontsize=11, loc="left",
+        )
+        ax.set_ylabel("NDCI (water)", fontsize=9)
+        ax.legend(fontsize=7, ncol=5, loc="upper left")
+        ax.grid(axis="y", linestyle=":", alpha=0.35)
+        ax.set_ylim(-0.15, 0.60)
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        fig.autofmt_xdate(rotation=25)
+
+    plt.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved comparison dashboard → %s", output_path)
+    return output_path

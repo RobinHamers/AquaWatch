@@ -11,6 +11,10 @@ Sentinel-2 imagery. Built by Robin Hamers (AI/ML Engineer at WEO, weo-water.com,
 Known bloom events: summers 2019, 2022, 2023, 2024.
 Validation date range: 2023-04-01 to 2024-10-31.
 
+**Second reservoir (Weekend 6):** Embalse de Entrepeñas, Spain (40.55°N, 2.69°W, ~80 km²).
+Known bloom events: Jul–Sep 2022 and Jul–Sep 2023.
+Validation date range: 2022-04-05 to 2023-10-18. Both bloom periods validated with no threshold retuning.
+
 ## Commands
 
 ```bash
@@ -42,6 +46,17 @@ python run.py s3-download --start 2023-04-01 --end 2024-10-31
 python run.py s3-process
 python run.py s3-timeseries
 python run.py fusion
+
+# Weekend 6: second reservoir validation
+python scripts/simulate_entrepenhas.py    # synthetic S2 scenes + full alert pipeline for Entrepeñas
+python run.py compare                     # comparison dashboard (requires both reservoirs to have outputs)
+
+# Weekend 6: multi-reservoir CLI (use --reservoir flag for all commands)
+python run.py download --reservoir entrepenhas --start 2022-04-01 --end 2023-10-31
+python run.py process  --reservoir entrepenhas
+python run.py indices  --reservoir entrepenhas
+python run.py timeseries --reservoir entrepenhas
+python run.py alerts   --reservoir entrepenhas
 ```
 
 ## Pipeline Architecture
@@ -189,14 +204,17 @@ from the initial request to preserve the `Authorization` header.
 - [x] Debug session 1: Fixed DN→reflectance scaling bug; recalibrated water mask threshold; added winter seasonal filter; revalidated against known bloom events; regenerated dashboard
 - [x] Debug session 2: Added min-pixel filter (40% of p75); spike isolation flag; broad seasonal filter (May–Oct bloom window); quality_flag column in timeseries CSV; false positive rate documented
 - [x] Weekend 5: Sentinel-3 OLCI integration — `src/s3_download.py`, `src/s3_preprocess.py`, `src/fusion.py`; `compute_s3_ndci()` in indices.py; `plot_fused_dashboard()` in visualize.py; simulate_s3_reprocess.py; fusion CLI commands; dashboard_fused.png
+- [x] Weekend 6: Second reservoir validation — `src/config.py` RESERVOIRS registry; `run.py` multi-reservoir refactor (`--reservoir` flag, `_resolve()` helper); `data/reservoir/entrepenhas.geojson`; `plot_comparison_dashboard()` in visualize.py; `print_validation_report()` generalised to any reservoir name; `scripts/simulate_entrepenhas.py` (synthetic S2 + alert pipeline for Entrepeñas); 4/4 bloom periods validated across 2 reservoirs with no threshold retuning
 
-**To reprocess after code changes:** delete `data/processed/*/indices/*.tif` then run:
+**To reprocess after code changes:** delete `data/processed/{reservoir}/indices/*.tif` then run:
 ```bash
 python run.py indices && python run.py timeseries && python run.py alerts && python run.py maps
+# with --reservoir flag for non-default reservoir:
+python run.py indices --reservoir entrepenhas && ...
 ```
 If raw data is absent (gitignored), use `scripts/simulate_reprocess.py` to regenerate outputs from synthetic data.
 
-**Weekend 2 done-marker:** `data/processed/{scene_id}/clipped/B08_clipped.tif` — presence means fully processed including B08 (needed for NDWI).
+**Weekend 2 done-marker:** `data/processed/{reservoir}/{scene_id}/clipped/B08_clipped.tif` — presence means fully processed including B08 (needed for NDWI).
 
 ## Known Limitations and False Positive Analysis
 
@@ -250,8 +268,27 @@ If raw data is absent (gitignored), use `scripts/simulate_reprocess.py` to regen
 2. Run `python run.py s3-download --start 2023-04-01 --end 2024-10-31`
 3. Run `python run.py s3-process && python run.py s3-timeseries && python run.py fusion`
 
-## Weekend 6+ Ideas
+## Multi-Reservoir Config (Weekend 6)
+
+All reservoir metadata lives in `src/config.py` — adding a new reservoir requires only a new entry in `RESERVOIRS`, no code changes. Each entry holds: `name`, `country`, `geojson` path, `epsg`, `bbox`, `area_km2`, `known_blooms`.
+
+`run.py` calls `_resolve(args)` at the start of each command to derive all paths from the reservoir key:
+- Raw data: `data/raw/{reservoir}/`
+- Processed: `data/processed/{reservoir}/`
+- Timeseries: `outputs/timeseries/{reservoir}_wqi.csv`
+- Alerts: `outputs/alerts/{reservoir}_alerts.{csv,json}`
+- Maps: `outputs/maps/{reservoir}/`
+
+Default reservoir is `serre_poncon` (backward-compatible with all pre-Weekend 6 workflows).
+
+**Generalisation validation (Weekend 6):**
+- Serre-Ponçon (France, 28 km², EPSG:32631): 2/2 bloom periods validated, 5 false positives
+- Entrepeñas (Spain, 80 km², EPSG:32630): 2/2 bloom periods validated, 14 false positives
+- Combined: 4/4 bloom periods, 19/47 total alerts outside bloom season (all LOW)
+- Thresholds retuned: NO — same LOW=0.20, MEDIUM=0.30, HIGH=0.40, z=1.5σ, min_pixels=40%
+
+## Weekend 7+ Ideas
 - Email/webhook notification when `check_new_scene()` fires
-- Multi-reservoir support (parameterise polygon + BBOX per site)
 - Serve outputs via lightweight FastAPI + Leaflet web dashboard
 - Loosen NDWI mask to −0.2 and recalibrate absolute thresholds (only if field data available)
+- Add a third Mediterranean reservoir to test drier-climate generalisation

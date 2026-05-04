@@ -3,9 +3,10 @@
 AquaWatch — command-line interface.
 
 Usage:
-    python run.py <command> [options]
+    python run.py <command> [--reservoir NAME] [options]
 
 Run `python run.py --help` for full command list.
+Reservoir defaults to 'serre_poncon' when --reservoir is omitted.
 """
 
 import argparse
@@ -24,15 +25,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger("aquawatch")
 
-RESERVOIR_GJ   = PROJECT_ROOT / "data" / "reservoir" / "serre_poncon.geojson"
-RAW_DIR        = PROJECT_ROOT / "data" / "raw"
-PROCESSED_DIR  = PROJECT_ROOT / "data" / "processed"
-TIMESERIES_CSV = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_wqi.csv"
-ALERTS_JSON    = PROJECT_ROOT / "outputs" / "alerts" / "serre_poncon_alerts.json"
-MAPS_DIR       = PROJECT_ROOT / "outputs" / "maps"
-BBOX           = [6.28, 44.49, 6.45, 44.62]
-CLOUD_MAX      = 30.0
-BANDS          = ["B03", "B04", "B05", "B08", "B8A", "SCL"]
+CLOUD_MAX = 30.0
+BANDS     = ["B03", "B04", "B05", "B08", "B8A", "SCL"]
+
+
+# ── Reservoir config resolution ───────────────────────────────────────────────
+
+def _resolve(args) -> dict:
+    """Return per-reservoir path and config dict from parsed args."""
+    from config import get_reservoir
+    name = getattr(args, "reservoir", "serre_poncon") or "serre_poncon"
+    cfg  = get_reservoir(name)
+
+    raw_dir       = PROJECT_ROOT / "data" / "raw" / name
+    processed_dir = PROJECT_ROOT / "data" / "processed" / name
+    ts_csv        = PROJECT_ROOT / "outputs" / "timeseries" / f"{name}_wqi.csv"
+    alerts_dir    = PROJECT_ROOT / "outputs" / "alerts"
+    alerts_json   = alerts_dir / f"{name}_alerts.json"
+    maps_dir      = PROJECT_ROOT / "outputs" / "maps" / name
+
+    return {
+        "name":          name,
+        "display_name":  cfg["name"],
+        "epsg":          cfg["epsg"],
+        "bbox":          cfg["bbox"],
+        "geojson":       Path(cfg["geojson"]),
+        "known_blooms":  cfg["known_blooms"],
+        "raw_dir":       raw_dir,
+        "processed_dir": processed_dir,
+        "ts_csv":        ts_csv,
+        "alerts_dir":    alerts_dir,
+        "alerts_json":   alerts_json,
+        "maps_dir":      maps_dir,
+        "s3_raw":        PROJECT_ROOT / "data" / "raw_s3" / name,
+        "s3_proc":       PROJECT_ROOT / "data" / "processed_s3" / name,
+        "s3_csv":        PROJECT_ROOT / "outputs" / "timeseries" / f"{name}_s3_wqi.csv",
+        "fused_csv":     PROJECT_ROOT / "outputs" / "timeseries" / f"{name}_fused.csv",
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -48,8 +77,8 @@ def _require_env() -> tuple[str, str]:
     return user, pwd
 
 
-def _scene_is_done(scene_id: str) -> bool:
-    return (PROCESSED_DIR / scene_id / "clipped" / "B08_clipped.tif").exists()
+def _scene_done(processed_dir: Path, scene_id: str) -> bool:
+    return (processed_dir / scene_id / "clipped" / "B08_clipped.tif").exists()
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -57,12 +86,9 @@ def _scene_is_done(scene_id: str) -> bool:
 def cmd_setup(args) -> None:
     """Create directory structure and validate credentials."""
     dirs = [
-        PROJECT_ROOT / "data" / "raw",
-        PROJECT_ROOT / "data" / "processed",
         PROJECT_ROOT / "data" / "reservoir",
         PROJECT_ROOT / "outputs" / "timeseries",
         PROJECT_ROOT / "outputs" / "alerts",
-        PROJECT_ROOT / "outputs" / "maps" / "previews",
         PROJECT_ROOT / "outputs" / "demo",
         PROJECT_ROOT / "notebooks",
     ]
@@ -76,10 +102,10 @@ def cmd_setup(args) -> None:
         if template.exists():
             import shutil
             shutil.copy(template, env_file)
-            print(f"\nCreated .env from template — fill in CDSE credentials.")
+            print("\nCreated .env from template — fill in CDSE credentials.")
         else:
-            env_file.write_text("CDSE_USERNAME=\nCDSEPASSWORD=\n")
-            print(f"\nCreated empty .env — fill in CDSE credentials.")
+            env_file.write_text("CDSE_USERNAME=\nCDSE_PASSWORD=\n")
+            print("\nCreated empty .env — fill in CDSE credentials.")
     else:
         from dotenv import load_dotenv
         load_dotenv(env_file)
@@ -92,11 +118,15 @@ def cmd_setup(args) -> None:
 def cmd_download(args) -> None:
     """Search and download Sentinel-2 scenes for a date range."""
     from download import search_sentinel2, download_scene
+    cfg = _resolve(args)
     username, password = _require_env()
 
-    logger.info("Searching %s → %s  cloud ≤ %.0f%%", args.start, args.end, CLOUD_MAX)
+    logger.info(
+        "[%s] Searching %s → %s  cloud ≤ %.0f%%",
+        cfg["name"], args.start, args.end, CLOUD_MAX,
+    )
     scenes = search_sentinel2(
-        bbox=BBOX,
+        bbox=cfg["bbox"],
         date_start=args.start,
         date_end=args.end,
         cloud_cover_max=CLOUD_MAX,
@@ -106,15 +136,17 @@ def cmd_download(args) -> None:
         logger.error("No scenes found.")
         sys.exit(1)
 
-    to_download = [s for s in scenes if not _scene_is_done(s["name"].replace(".SAFE", ""))]
-    print(f"\nFound {len(scenes)} scene(s) — {len(to_download)} to download.\n")
+    raw_dir = cfg["raw_dir"]
+    proc_dir = cfg["processed_dir"]
+    to_dl = [s for s in scenes if not _scene_done(proc_dir, s["name"].replace(".SAFE", ""))]
+    print(f"\nFound {len(scenes)} scene(s) — {len(to_dl)} to download.\n")
 
-    for scene in to_download:
+    for scene in to_dl:
         scene_id = scene["name"].replace(".SAFE", "")
         try:
             download_scene(
                 scene=scene,
-                output_dir=RAW_DIR / scene_id,
+                output_dir=raw_dir / scene_id,
                 username=username,
                 password=password,
                 bands=BANDS,
@@ -126,9 +158,17 @@ def cmd_download(args) -> None:
 def cmd_process(args) -> None:
     """Apply cloud masking and clip all raw scenes not yet processed."""
     from preprocess import apply_cloud_mask, clip_to_reservoir
+    cfg = _resolve(args)
 
-    raw_scenes = [d for d in RAW_DIR.iterdir() if d.is_dir()]
-    to_process = [d for d in raw_scenes if not _scene_is_done(d.name)]
+    raw_dir  = cfg["raw_dir"]
+    proc_dir = cfg["processed_dir"]
+
+    if not raw_dir.exists():
+        logger.error("No raw data for %s at %s", cfg["name"], raw_dir)
+        sys.exit(1)
+
+    raw_scenes = [d for d in raw_dir.iterdir() if d.is_dir()]
+    to_process = [d for d in raw_scenes if not _scene_done(proc_dir, d.name)]
     print(f"{len(raw_scenes)} raw scene(s), {len(to_process)} to process.\n")
 
     for scene_dir in to_process:
@@ -139,8 +179,8 @@ def cmd_process(args) -> None:
             continue
 
         scl_path = jp2s.pop("SCL")
-        masked_dir = PROCESSED_DIR / scene_id / "masked"
-        clipped_dir = PROCESSED_DIR / scene_id / "clipped"
+        masked_dir  = proc_dir / scene_id / "masked"
+        clipped_dir = proc_dir / scene_id / "clipped"
 
         try:
             masked = apply_cloud_mask(
@@ -151,9 +191,9 @@ def cmd_process(args) -> None:
             masked["SCL"] = scl_path
             clip_to_reservoir(
                 band_paths=masked,
-                reservoir_geojson=RESERVOIR_GJ,
+                reservoir_geojson=cfg["geojson"],
                 output_dir=clipped_dir,
-                target_crs="EPSG:32632",
+                target_crs=cfg["epsg"],
             )
             logger.info("Processed %s", scene_id[:50])
         except Exception:
@@ -163,9 +203,15 @@ def cmd_process(args) -> None:
 def cmd_indices(args) -> None:
     """Compute water quality indices for all fully clipped scenes."""
     from indices import compute_all_indices
+    cfg = _resolve(args)
+
+    proc_dir = cfg["processed_dir"]
+    if not proc_dir.exists():
+        logger.error("No processed data for %s at %s", cfg["name"], proc_dir)
+        sys.exit(1)
 
     scene_dirs = [
-        d for d in PROCESSED_DIR.iterdir()
+        d for d in proc_dir.iterdir()
         if d.is_dir() and (d / "clipped" / "B08_clipped.tif").exists()
     ]
     print(f"{len(scene_dirs)} scene(s) eligible for index computation.\n")
@@ -189,17 +235,17 @@ def cmd_indices(args) -> None:
 def cmd_timeseries(args) -> None:
     """Build time series CSV from all processed scenes."""
     from timeseries import build_timeseries, plot_timeseries
-    import pandas as pd
+    cfg = _resolve(args)
 
-    output_csv = TIMESERIES_CSV
-    df = build_timeseries(processed_dir=PROCESSED_DIR, output_path=output_csv)
+    output_csv = cfg["ts_csv"]
+    df = build_timeseries(processed_dir=cfg["processed_dir"], output_path=output_csv)
     if df.empty:
         logger.error("No scenes processed — run download + process + indices first")
         sys.exit(1)
 
     plot_path = output_csv.with_suffix(".png")
     plot_timeseries(df=df, output_path=plot_path)
-    print(f"\nTime series: {len(df)} scenes")
+    print(f"\nTime series [{cfg['display_name']}]: {len(df)} scenes")
     print(f"CSV  → {output_csv.relative_to(PROJECT_ROOT)}")
     print(f"Plot → {plot_path.relative_to(PROJECT_ROOT)}")
 
@@ -209,30 +255,32 @@ def cmd_alerts(args) -> None:
     import pandas as pd
     from alerts import (
         compute_rolling_baseline, detect_alerts, save_alerts,
-        summarize_alerts, validate_against_known_events,
-        apply_seasonal_filter, flag_isolated_spikes, print_validation_report,
+        summarize_alerts, apply_seasonal_filter, flag_isolated_spikes,
+        print_validation_report,
     )
     from datetime import date as date_cls
+    cfg = _resolve(args)
 
-    if not TIMESERIES_CSV.exists():
-        logger.error("Run timeseries first: python run.py timeseries")
+    ts_csv = cfg["ts_csv"]
+    if not ts_csv.exists():
+        logger.error("Run timeseries first: python run.py timeseries --reservoir %s", cfg["name"])
         sys.exit(1)
 
-    df = pd.read_csv(TIMESERIES_CSV, parse_dates=["date"])
+    df = pd.read_csv(ts_csv, parse_dates=["date"])
     df = df.set_index("date").sort_index()
     df = compute_rolling_baseline(df)
 
-    alerts = detect_alerts(df, z_score_threshold=1.5)
-    alerts = flag_isolated_spikes(alerts)    # flag while severity reflects absolute NDCI
-    alerts = apply_seasonal_filter(alerts)   # then downgrade off-season events
-    save_alerts(alerts, PROJECT_ROOT / "outputs" / "alerts", "serre_poncon")
+    alerts = detect_alerts(df, z_score_threshold=1.5, reservoir_name=cfg["name"])
+    alerts = flag_isolated_spikes(alerts)
+    alerts = apply_seasonal_filter(alerts)
+    save_alerts(alerts, cfg["alerts_dir"], cfg["name"])
     summarize_alerts(alerts)
 
     bloom_periods = [
-        (date_cls(2023, 7, 1), date_cls(2023, 8, 31), "Jul-Aug 2023"),
-        (date_cls(2024, 6, 1), date_cls(2024, 8, 31), "Jun-Aug 2024"),
+        (date_cls.fromisoformat(b["start"]), date_cls.fromisoformat(b["end"]), b["label"])
+        for b in cfg["known_blooms"]
     ]
-    print_validation_report(df, alerts, bloom_periods)
+    print_validation_report(df, alerts, bloom_periods, reservoir_name=cfg["display_name"])
 
 
 def cmd_maps(args) -> None:
@@ -251,9 +299,14 @@ def cmd_dashboard(args) -> None:
     import pandas as pd
     from alerts import Alert
     from visualize import plot_dashboard
+    cfg = _resolve(args)
 
-    df = pd.read_csv(TIMESERIES_CSV, parse_dates=["date"])
-    with open(ALERTS_JSON) as fh:
+    ts_csv      = cfg["ts_csv"]
+    alerts_json = cfg["alerts_json"]
+    maps_dir    = cfg["maps_dir"]
+
+    df = pd.read_csv(ts_csv, parse_dates=["date"])
+    with open(alerts_json) as fh:
         payload = json.load(fh)
     alerts = [
         Alert(
@@ -267,8 +320,8 @@ def cmd_dashboard(args) -> None:
         )
         for a in payload["alerts"]
     ]
-    out = MAPS_DIR / "dashboard.png"
-    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    out = maps_dir / "dashboard.png"
+    maps_dir.mkdir(parents=True, exist_ok=True)
     plot_dashboard(df=df, alerts=alerts, output_path=out)
     print(f"Dashboard → {out.relative_to(PROJECT_ROOT)}")
 
@@ -278,16 +331,16 @@ def cmd_check(args) -> None:
     import pandas as pd
     from datetime import date as date_cls
     from alerts import check_new_scene
+    cfg = _resolve(args)
 
-    if not TIMESERIES_CSV.exists():
+    ts_csv = cfg["ts_csv"]
+    if not ts_csv.exists():
         logger.error("No time series CSV found. Run the full pipeline first.")
         sys.exit(1)
 
     target = date_cls.fromisoformat(args.date)
-    df = pd.read_csv(TIMESERIES_CSV, parse_dates=["date"])
+    df = pd.read_csv(ts_csv, parse_dates=["date"])
     df["_date"] = df["date"].dt.date
-
-    # Find closest processed scene to requested date
     df["_gap"] = (df["_date"] - target).abs().apply(lambda x: x.days)
     closest = df.nsmallest(1, "_gap").iloc[0]
     gap_days = int(closest["_gap"])
@@ -295,7 +348,6 @@ def cmd_check(args) -> None:
     if gap_days > 10:
         print(f"\nNo processed scene within 10 days of {target}.")
         print(f"Closest is {closest['_date']} ({gap_days} days away).")
-        print("Run: python run.py download --start <date-10d> --end <date+10d>")
         sys.exit(0)
 
     if gap_days > 0:
@@ -303,32 +355,30 @@ def cmd_check(args) -> None:
 
     stats = {
         "date": str(closest["_date"]),
-        "ndci_water_mean": closest.get("ndci_water_mean", float("nan")),
-        "ndci_water_p90":  closest.get("ndci_water_p90",  float("nan")),
+        "ndci_water_mean":      closest.get("ndci_water_mean", float("nan")),
+        "ndci_water_p90":       closest.get("ndci_water_p90",  float("nan")),
         "turbidity_water_mean": closest.get("turbidity_water_mean", float("nan")),
-        "ndci_water_n": int(closest.get("ndci_water_n", 0)),
+        "ndci_water_n":         int(closest.get("ndci_water_n", 0)),
     }
-
-    # Historical = all scenes strictly before the target date
     hist = df[df["_date"] < target].drop(columns=["_date", "_gap"]).set_index("date")
 
     alert = check_new_scene(
         new_scene_stats=stats,
         historical_df=hist,
-        reservoir_name="serre_poncon",
+        reservoir_name=cfg["name"],
         z_score_threshold=1.5,
     )
 
     print()
     if alert:
-        print(f"  ⚠  ALERT — {alert.severity}")
+        print(f"  ⚠  ALERT [{cfg['display_name']}] — {alert.severity}")
         print(f"     Date     : {alert.date}")
         print(f"     NDCI     : {alert.ndci_mean:.4f}")
         print(f"     Z-score  : {alert.z_score:.2f}")
         print(f"     Baseline : {alert.baseline_ndci:.4f} ± {alert.baseline_std:.4f}")
         print(f"     Pixels   : {alert.valid_pixels:,}")
     else:
-        print(f"  ✓  ALL CLEAR — {stats['date']}")
+        print(f"  ✓  ALL CLEAR [{cfg['display_name']}] — {stats['date']}")
         print(f"     NDCI={stats['ndci_water_mean']:.4f}")
     print()
 
@@ -336,11 +386,12 @@ def cmd_check(args) -> None:
 def cmd_s3_download(args) -> None:
     """Search and download Sentinel-3 OLCI WFR scenes for a date range."""
     from s3_download import search_sentinel3_olci, download_s3_scene
+    cfg = _resolve(args)
     username, password = _require_env()
 
-    logger.info("Searching S3 OLCI %s → %s", args.start, args.end)
+    logger.info("[%s] Searching S3 OLCI %s → %s", cfg["name"], args.start, args.end)
     scenes = search_sentinel3_olci(
-        bbox=BBOX,
+        bbox=cfg["bbox"],
         date_start=args.start,
         date_end=args.end,
         max_results=600,
@@ -349,7 +400,7 @@ def cmd_s3_download(args) -> None:
         logger.error("No Sentinel-3 scenes found.")
         sys.exit(1)
 
-    s3_raw = PROJECT_ROOT / "data" / "raw_s3"
+    s3_raw = cfg["s3_raw"]
     to_dl = [s for s in scenes if not (s3_raw / s["Name"].replace(".SEN3", "")).exists()]
     print(f"\nFound {len(scenes)} S3 scene(s) — {len(to_dl)} to download.\n")
 
@@ -370,6 +421,7 @@ def cmd_s3_process(args) -> None:
     """Apply WQSF mask, reproject, and clip all downloaded S3 scenes."""
     from s3_download import _nc_to_geotiff
     from s3_preprocess import apply_wqsf_mask, clip_s3_to_reservoir
+    cfg = _resolve(args)
 
     try:
         from netCDF4 import Dataset as NC4Dataset
@@ -380,9 +432,9 @@ def cmd_s3_process(args) -> None:
         )
         sys.exit(1)
 
-    s3_raw      = PROJECT_ROOT / "data" / "raw_s3"
-    s3_proc     = PROJECT_ROOT / "data" / "processed_s3"
-    scene_dirs  = [d for d in s3_raw.iterdir() if d.is_dir()] if s3_raw.exists() else []
+    s3_raw  = cfg["s3_raw"]
+    s3_proc = cfg["s3_proc"]
+    scene_dirs = [d for d in s3_raw.iterdir() if d.is_dir()] if s3_raw.exists() else []
     print(f"{len(scene_dirs)} raw S3 scene(s) to process.\n")
 
     for scene_dir in scene_dirs:
@@ -395,10 +447,9 @@ def cmd_s3_process(args) -> None:
             lat = ds["latitude"][:]
             lon = ds["longitude"][:]
 
-        bands = {"Oa08_reflectance": scene_dir / "Oa08_reflectance.nc",
-                 "Oa11_reflectance": scene_dir / "Oa11_reflectance.nc"}
+        bands   = {"Oa08_reflectance": scene_dir / "Oa08_reflectance.nc",
+                   "Oa11_reflectance": scene_dir / "Oa11_reflectance.nc"}
         wqsf_nc = scene_dir / "WQSF.nc"
-
         tif_dir = s3_proc / scene_dir.name / "tif"
         tif_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,23 +458,21 @@ def cmd_s3_process(args) -> None:
             if not nc_path.exists():
                 continue
             out_tif = tif_dir / f"{band_name}.tif"
-            _nc_to_geotiff(nc_path, band_name, lat, lon, out_tif)
+            _nc_to_geotiff(nc_path, band_name, lat, lon, out_tif, target_crs=cfg["epsg"])
             band_tifs[band_name] = out_tif
 
-        # Reproject WQSF the same way (uint32 — don't scale)
         if wqsf_nc.exists():
             wqsf_tif = tif_dir / "WQSF.tif"
             if not wqsf_tif.exists():
-                _nc_to_geotiff(wqsf_nc, "WQSF", lat, lon, wqsf_tif)
-
+                _nc_to_geotiff(wqsf_nc, "WQSF", lat, lon, wqsf_tif, target_crs=cfg["epsg"])
             masked = apply_wqsf_mask(
                 band_paths=band_tifs,
-                wqsf_path=tif_dir / "WQSF.tif",
+                wqsf_path=wqsf_tif,
                 output_dir=s3_proc / scene_dir.name / "masked",
             )
             clip_s3_to_reservoir(
                 band_paths=masked,
-                reservoir_geojson=RESERVOIR_GJ,
+                reservoir_geojson=cfg["geojson"],
                 output_dir=s3_proc / scene_dir.name / "clipped",
             )
         logger.info("Processed S3 %s", scene_dir.name[:50])
@@ -431,11 +480,14 @@ def cmd_s3_process(args) -> None:
 
 def cmd_s3_timeseries(args) -> None:
     """Build S3 NDCI time series CSV from all processed S3 scenes."""
-    from indices import compute_s3_ndci
+    import numpy as np
+    import pandas as pd
     import rasterio
+    from indices import compute_s3_ndci
+    cfg = _resolve(args)
 
-    s3_proc  = PROJECT_ROOT / "data" / "processed_s3"
-    out_csv  = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_s3_wqi.csv"
+    s3_proc = cfg["s3_proc"]
+    out_csv = cfg["s3_csv"]
 
     if not s3_proc.exists():
         logger.error("No processed S3 scenes found. Run s3-process first.")
@@ -479,14 +531,12 @@ def cmd_s3_timeseries(args) -> None:
         logger.error("No S3 scenes produced valid NDCI stats.")
         sys.exit(1)
 
-    import numpy as np
-    import pandas as pd
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
-    print(f"\nS3 time series: {len(df)} scenes → {out_csv.relative_to(PROJECT_ROOT)}")
+    print(f"\nS3 time series [{cfg['display_name']}]: {len(df)} scenes → {out_csv.relative_to(PROJECT_ROOT)}")
 
 
 def cmd_fusion(args) -> None:
@@ -496,124 +546,187 @@ def cmd_fusion(args) -> None:
     from fusion import build_fused_timeseries, detect_s3_precursor_alerts, print_fusion_report
     from visualize import plot_fused_dashboard
     from alerts import compute_rolling_baseline, detect_alerts, flag_isolated_spikes, apply_seasonal_filter
+    cfg = _resolve(args)
 
-    s2_csv = TIMESERIES_CSV
-    s3_csv = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_s3_wqi.csv"
-
+    s2_csv = cfg["ts_csv"]
+    s3_csv = cfg["s3_csv"]
     for path in (s2_csv, s3_csv):
         if not path.exists():
-            logger.error("Missing: %s — run the relevant timeseries step first.", path)
+            logger.error("Missing: %s", path)
             sys.exit(1)
 
-    fused_csv = PROJECT_ROOT / "outputs" / "timeseries" / "serre_poncon_fused.csv"
-    fused_df  = build_fused_timeseries(s2_csv, s3_csv, fused_csv)
+    fused_df = build_fused_timeseries(s2_csv, s3_csv, cfg["fused_csv"])
 
     s2_df = pd.read_csv(s2_csv, parse_dates=["date"])
     s3_df = pd.read_csv(s3_csv, parse_dates=["date"])
 
     s2_idx = s2_df.set_index("date").sort_index()
     s2_idx = compute_rolling_baseline(s2_idx)
-    alerts  = detect_alerts(s2_idx, z_score_threshold=1.5)
+    alerts  = detect_alerts(s2_idx, z_score_threshold=1.5, reservoir_name=cfg["name"])
     alerts  = flag_isolated_spikes(alerts)
     alerts  = apply_seasonal_filter(alerts)
 
     bloom_periods = [
-        (date_cls(2023, 7, 1), date_cls(2023, 8, 31), "Jul–Aug 2023"),
-        (date_cls(2024, 6, 1), date_cls(2024, 8, 31), "Jun–Aug 2024"),
+        (date_cls.fromisoformat(b["start"]), date_cls.fromisoformat(b["end"]), b["label"])
+        for b in cfg["known_blooms"]
     ]
     events = detect_s3_precursor_alerts(fused_df, bloom_periods)
     print_fusion_report(fused_df, events, len(s3_df), len(s2_df))
 
-    dash_path = MAPS_DIR / "dashboard_fused.png"
-    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    maps_dir = cfg["maps_dir"]
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    dash_path = maps_dir / "dashboard_fused.png"
     plot_fused_dashboard(
-        s2_df=s2_df,
-        s3_df=s3_df,
-        alerts=alerts,
-        precursor_events=events,
+        s2_df=s2_df, s3_df=s3_df,
+        alerts=alerts, precursor_events=events,
         output_path=dash_path,
     )
     print(f"Fused dashboard → {dash_path.relative_to(PROJECT_ROOT)}")
 
 
-def cmd_run_all(args) -> None:
-    """Run the full pipeline end to end."""
-    print("=== AquaWatch — Full Pipeline ===\n")
+def cmd_compare(args) -> None:
+    """Generate cross-reservoir comparison dashboard."""
+    import json
+    from datetime import date as date_cls
+    import pandas as pd
+    from config import RESERVOIRS
+    from alerts import Alert
+    from visualize import plot_comparison_dashboard
 
-    class NS:
+    reservoirs_data = {}
+    for res_name, res_cfg in RESERVOIRS.items():
+        ts_csv    = PROJECT_ROOT / "outputs" / "timeseries" / f"{res_name}_wqi.csv"
+        alerts_json = PROJECT_ROOT / "outputs" / "alerts" / f"{res_name}_alerts.json"
+        if not ts_csv.exists() or not alerts_json.exists():
+            logger.warning("Skipping %s — outputs not found", res_name)
+            continue
+
+        df = pd.read_csv(ts_csv, parse_dates=["date"])
+        with open(alerts_json) as fh:
+            payload = json.load(fh)
+        alerts_list = [
+            Alert(
+                date=date_cls.fromisoformat(a["date"]),
+                reservoir=a["reservoir"], severity=a["severity"],
+                ndci_mean=a["ndci_mean"], ndci_p90=a["ndci_p90"],
+                turbidity_mean=a["turbidity_mean"],
+                baseline_ndci=a["baseline_ndci"], baseline_std=a["baseline_std"],
+                z_score=a["z_score"], valid_pixels=a["valid_pixels"],
+                notes=a.get("notes", ""),
+            )
+            for a in payload["alerts"]
+        ]
+        reservoirs_data[res_name] = {
+            "timeseries": df,
+            "alerts": alerts_list,
+            "config": res_cfg,
+        }
+
+    if len(reservoirs_data) < 2:
+        logger.error(
+            "Need outputs for at least 2 reservoirs. "
+            "Run: python run.py run-all --reservoir serre_poncon ... && "
+            "python run.py run-all --reservoir entrepenhas ..."
+        )
+        sys.exit(1)
+
+    out = PROJECT_ROOT / "outputs" / "demo" / "comparison_dashboard.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plot_comparison_dashboard(reservoirs=reservoirs_data, output_path=out)
+    print(f"Comparison dashboard → {out.relative_to(PROJECT_ROOT)}")
+
+
+def cmd_run_all(args) -> None:
+    """Run the full S2 pipeline end to end for one reservoir."""
+    cfg = _resolve(args)
+    print(f"=== AquaWatch — Full Pipeline [{cfg['display_name']}] ===\n")
+
+    class _NS:
         pass
 
-    ns = NS()
-    ns.start = args.start
-    ns.end = args.end
+    ns = _NS()
+    ns.start    = args.start
+    ns.end      = args.end
+    ns.reservoir = cfg["name"]
 
-    print("Step 1/6  download")
-    cmd_download(ns)
-
-    print("\nStep 2/6  process")
-    cmd_process(ns)
-
-    print("\nStep 3/6  indices")
-    cmd_indices(ns)
-
-    print("\nStep 4/6  timeseries")
-    cmd_timeseries(ns)
-
-    print("\nStep 5/6  alerts")
-    cmd_alerts(ns)
-
-    print("\nStep 6/6  maps")
-    cmd_maps(ns)
+    for step, fn in [
+        ("download",   cmd_download),
+        ("process",    cmd_process),
+        ("indices",    cmd_indices),
+        ("timeseries", cmd_timeseries),
+        ("alerts",     cmd_alerts),
+        ("maps",       cmd_maps),
+    ]:
+        print(f"\n── {step} ──")
+        fn(ns)
 
     print("\n=== Done ===")
-    print(f"  Time series : {TIMESERIES_CSV.relative_to(PROJECT_ROOT)}")
-    print(f"  Alerts      : outputs/alerts/serre_poncon_alerts.{{csv,json}}")
-    print(f"  Dashboard   : outputs/maps/dashboard.png")
-    print(f"  Demo pack   : outputs/demo/")
+    print(f"  Time series : {cfg['ts_csv'].relative_to(PROJECT_ROOT)}")
+    print(f"  Alerts      : outputs/alerts/{cfg['name']}_alerts.{{csv,json}}")
+    print(f"  Dashboard   : outputs/maps/{cfg['name']}/dashboard.png")
 
 
 # ── Argument parser ───────────────────────────────────────────────────────────
 
+def _add_reservoir(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--reservoir", default="serre_poncon", metavar="NAME",
+        help="Reservoir key from config.py (default: serre_poncon)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python run.py",
-        description="AquaWatch — Sentinel-2 water quality monitor for Serre-Ponçon",
+        description="AquaWatch — multi-reservoir Sentinel-2 water quality monitor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python run.py setup
-  python run.py download --start 2024-06-01 --end 2024-08-31
-  python run.py check --date 2024-08-21
-  python run.py run-all --start 2023-04-01 --end 2024-10-31
+  python run.py download --reservoir serre_poncon --start 2024-06-01 --end 2024-08-31
+  python run.py run-all  --reservoir entrepenhas  --start 2022-04-01 --end 2023-10-31
+  python run.py check    --reservoir serre_poncon --date 2024-08-21
+  python run.py compare
         """,
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sub.add_parser("setup",        help="Create directory structure and validate credentials")
-    sub.add_parser("process",      help="Cloud-mask and clip all downloaded S2 raw scenes")
-    sub.add_parser("indices",      help="Compute NDCI / NDWI / turbidity index rasters")
-    sub.add_parser("timeseries",   help="Aggregate S2 scene statistics into a time series CSV")
-    sub.add_parser("alerts",       help="Run anomaly detection and generate alert log")
-    sub.add_parser("maps",         help="Generate spatial maps for all alerts")
-    sub.add_parser("dashboard",    help="Generate summary dashboard PNG")
-    sub.add_parser("s3-process",   help="WQSF-mask, reproject, and clip downloaded S3 scenes")
-    sub.add_parser("s3-timeseries",help="Build S3 NDCI time series CSV")
-    sub.add_parser("fusion",       help="Run S2/S3 fusion analysis and generate fused dashboard")
+    # Commands that don't need --reservoir
+    sub.add_parser("setup",   help="Create directory structure and validate credentials")
+    sub.add_parser("compare", help="Generate cross-reservoir comparison dashboard")
 
-    dl = sub.add_parser("download",    help="Download Sentinel-2 scenes for a date range")
-    dl.add_argument("--start", required=True, metavar="YYYY-MM-DD", help="Start date")
-    dl.add_argument("--end",   required=True, metavar="YYYY-MM-DD", help="End date")
+    # Commands that need --reservoir
+    for name, helpstr in [
+        ("process",       "Cloud-mask and clip all downloaded S2 raw scenes"),
+        ("indices",       "Compute NDCI / NDWI / turbidity index rasters"),
+        ("timeseries",    "Aggregate S2 scene statistics into a time series CSV"),
+        ("alerts",        "Run anomaly detection and generate alert log"),
+        ("maps",          "Generate spatial maps for all alerts"),
+        ("dashboard",     "Generate summary dashboard PNG"),
+        ("s3-process",    "WQSF-mask, reproject, and clip downloaded S3 scenes"),
+        ("s3-timeseries", "Build S3 NDCI time series CSV"),
+        ("fusion",        "Run S2/S3 fusion analysis and generate fused dashboard"),
+    ]:
+        p = sub.add_parser(name, help=helpstr)
+        _add_reservoir(p)
+
+    dl = sub.add_parser("download", help="Download Sentinel-2 scenes for a date range")
+    _add_reservoir(dl)
+    dl.add_argument("--start", required=True, metavar="YYYY-MM-DD")
+    dl.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
 
     s3dl = sub.add_parser("s3-download", help="Download Sentinel-3 OLCI WFR scenes for a date range")
+    _add_reservoir(s3dl)
     s3dl.add_argument("--start", required=True, metavar="YYYY-MM-DD")
     s3dl.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
 
     ra = sub.add_parser("run-all", help="Run full S2 pipeline end to end")
+    _add_reservoir(ra)
     ra.add_argument("--start", required=True, metavar="YYYY-MM-DD")
     ra.add_argument("--end",   required=True, metavar="YYYY-MM-DD")
 
-    ch = sub.add_parser("check",
-                         help="Check a date against historical baseline (operational mode)")
+    ch = sub.add_parser("check", help="Check a date against historical baseline (operational mode)")
+    _add_reservoir(ch)
     ch.add_argument("--date", required=True, metavar="YYYY-MM-DD",
                     help="Date to check (uses closest processed scene)")
 
@@ -635,6 +748,7 @@ def main() -> None:
         "dashboard":     cmd_dashboard,
         "check":         cmd_check,
         "run-all":       cmd_run_all,
+        "compare":       cmd_compare,
         "s3-download":   cmd_s3_download,
         "s3-process":    cmd_s3_process,
         "s3-timeseries": cmd_s3_timeseries,

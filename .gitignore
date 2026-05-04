@@ -1,5 +1,6 @@
-# Data and heavy outputs
+# Data and heavy outputs (raw satellite data + processed rasters)
 data/
+!data/reservoir/
 outputs/
 *.tif
 *.SAFE
