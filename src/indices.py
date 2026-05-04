@@ -10,11 +10,24 @@ from rasterio.crs import CRS
 logger = logging.getLogger(__name__)
 
 
-def _read_band(path: Path) -> tuple[np.ndarray, dict]:
+def validate_reflectance(array: np.ndarray, band_name: str) -> None:
+    mean_val = np.nanmean(array)
+    if mean_val > 1.0:
+        logger.warning(
+            "%s: mean value %.1f suggests unscaled DN. Expected range 0.0-1.0 after /10000.",
+            band_name, mean_val,
+        )
+
+
+def _read_band(path: Path, scale: bool = True) -> tuple[np.ndarray, dict]:
     with rasterio.open(path) as src:
         data = src.read(1, masked=True).astype(np.float32)
         profile = src.profile.copy()
     arr = np.where(data.mask, np.nan, data.data)
+    if scale:
+        arr = np.where(arr == 0, np.nan, arr)   # DN=0 is nodata in S2 L2A
+        arr = arr / 10000.0
+        validate_reflectance(arr, path.name)
     return arr, profile
 
 
@@ -112,18 +125,19 @@ def apply_water_mask(
     index_path: Path,
     ndwi_path: Path,
     output_path: Path,
-    ndwi_threshold: float = -0.2,
+    ndwi_threshold: float = 0.1,
 ) -> Path:
     """Mask index to water pixels only (NDWI > threshold).
 
     Non-water pixels are set to NaN. Preserves existing NaN coverage.
+    Threshold of 0.1 excludes mixed shoreline pixels; use lower values for more permissive masking.
     """
     if output_path.exists():
         logger.debug("Water-masked index already exists: %s", output_path.name)
         return output_path
 
-    index, profile = _read_band(index_path)
-    ndwi, _ = _read_band(ndwi_path)
+    index, profile = _read_band(index_path, scale=False)
+    ndwi, _ = _read_band(ndwi_path, scale=False)
 
     water_mask = ndwi > ndwi_threshold
     masked = np.where(water_mask, index, np.nan)

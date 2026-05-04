@@ -145,6 +145,16 @@ def detect_alerts(
             severity = _severity_from_zscore(z)
             trigger_notes = f"z-score={z:.2f} ≥ {z_score_threshold}"
 
+        # Winter HIGH suppression: ice/snow/sediment can mimic bloom NDCI in Dec–Feb.
+        # Downgrade to MEDIUM unless turbidity is also elevated (turbidity_mean > 0.95).
+        alert_month = (idx.date() if hasattr(idx, "date") else idx).month
+        turb_val = row.get(_TURB_MEAN, np.nan)
+        if (severity == "HIGH"
+                and alert_month in (12, 1, 2)
+                and (np.isnan(turb_val) or turb_val <= 0.95)):
+            severity = "MEDIUM"
+            trigger_notes += " [downgraded: winter HIGH without elevated turbidity]"
+
         alert = Alert(
             date=idx.date() if hasattr(idx, "date") else idx,
             reservoir="serre_poncon",
@@ -294,6 +304,63 @@ def validate_against_known_events(
                 all_pass = False
 
     print("─────────────────────────────────────────────────────────\n")
+    return all_pass
+
+
+def print_validation_report(
+    df: pd.DataFrame,
+    alerts: list[Alert],
+    bloom_periods: list[tuple[date, date, str]],
+) -> bool:
+    """Print a structured validation report against known bloom periods.
+
+    Returns True if all bloom periods have at least one MEDIUM/HIGH alert.
+    """
+    print("\n=== AquaWatch Validation Report — Serre-Ponçon ===")
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df["date"])
+
+    all_pass = True
+    covered_dates: set[date] = set()
+
+    for i, (start, end, label) in enumerate(bloom_periods, 1):
+        period_alerts = [a for a in alerts if start <= a.date <= end]
+        counts = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+        for a in period_alerts:
+            counts[a.severity] += 1
+
+        # Max NDCI from time series (not just alerted scenes)
+        mask = (df.index.date >= start) & (df.index.date <= end)
+        period_df = df.loc[mask]
+        if not period_df.empty and _NDCI_MEAN in period_df.columns:
+            max_idx = period_df[_NDCI_MEAN].idxmax()
+            max_ndci = period_df.loc[max_idx, _NDCI_MEAN]
+            max_date = max_idx.date() if hasattr(max_idx, "date") else max_idx
+        else:
+            max_ndci = float("nan")
+            max_date = None
+
+        medium_high = [a for a in period_alerts if a.severity in ("MEDIUM", "HIGH")]
+        status = "✅ VALIDATED" if medium_high else "❌ NOT VALIDATED"
+        if not medium_high:
+            all_pass = False
+
+        print(f"\nBloom period {i}: {label}")
+        print(f"  Alerts detected: {len(period_alerts)} "
+              f"(LOW: {counts['LOW']}, MEDIUM: {counts['MEDIUM']}, HIGH: {counts['HIGH']})")
+        ndci_str = f"{max_ndci:.3f}" if not np.isnan(max_ndci) else "N/A"
+        date_str = str(max_date) if max_date else "N/A"
+        print(f"  Max NDCI in period: {ndci_str} (date: {date_str})")
+        print(f"  Status: {status}")
+
+        for a in period_alerts:
+            covered_dates.add(a.date)
+
+    false_positives = [a for a in alerts if a.date not in covered_dates]
+    print(f"\nFalse positives outside bloom periods: {len(false_positives)}")
+    print("=" * 50 + "\n")
     return all_pass
 
 

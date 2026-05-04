@@ -3,7 +3,6 @@
 import logging
 from pathlib import Path
 
-import geopandas as gpd
 import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
@@ -15,7 +14,7 @@ import rasterio
 logger = logging.getLogger(__name__)
 
 SEVERITY_COLORS = {"LOW": "#FFC107", "MEDIUM": "#FF7043", "HIGH": "#D32F2F"}
-NDCI_VMIN, NDCI_VMAX = -0.05, 0.05
+NDCI_VMIN, NDCI_VMAX = -0.1, 0.5
 
 
 def _add_scalebar(ax, x_span_m: float) -> None:
@@ -56,6 +55,7 @@ def plot_alert_map(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    import geopandas as gpd
     with rasterio.open(ndci_path) as src:
         ndci = src.read(1, masked=True).astype(np.float32)
         bounds = src.bounds
@@ -124,6 +124,7 @@ def plot_bloom_comparison(
     fig.suptitle(title, fontsize=13)
     last_img = None
 
+    import geopandas as gpd
     for i, (d, path, ax) in enumerate(zip(dates, ndci_paths, axes)):
         with rasterio.open(path) as src:
             ndci = src.read(1, masked=True).astype(np.float32)
