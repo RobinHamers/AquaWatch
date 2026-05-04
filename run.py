@@ -67,12 +67,17 @@ def _resolve(args) -> dict:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _require_env() -> tuple[str, str]:
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / ".env")
+    env_file = PROJECT_ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
     user = os.environ.get("CDSE_USERNAME", "")
     pwd  = os.environ.get("CDSE_PASSWORD", "")
     if not user or not pwd:
-        logger.error("CDSE_USERNAME and CDSE_PASSWORD must be set in .env")
+        logger.error("CDSE_USERNAME and CDSE_PASSWORD must be set (env vars or .env)")
         sys.exit(1)
     return user, pwd
 

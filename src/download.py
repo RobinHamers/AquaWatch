@@ -256,35 +256,63 @@ def _stream_download(
     url: str,
     local_path: Path,
     label: str,
+    max_retries: int = 4,
 ) -> None:
-    """Stream a file download with tqdm progress bar.
+    """Stream a file download with tqdm progress bar and retry on stall.
 
-    Follows redirects manually to preserve the Authorization header
-    across cross-domain redirects issued by CDSE storage backends.
+    Uses a (connect, read) timeout tuple so that a silent TCP connection
+    raises ReadTimeout rather than blocking forever.  Partial files are
+    deleted before each retry so the download always restarts cleanly.
     """
-    resp = session.get(url, allow_redirects=False, stream=True, timeout=120)
+    _CONNECT_TIMEOUT = 30   # seconds to establish connection
+    _READ_TIMEOUT    = 60   # seconds of silence before giving up on a chunk
 
-    # Follow redirects manually to keep auth header
-    hops = 0
-    while resp.status_code in (301, 302, 303, 307, 308) and hops < 5:
-        redirect_url = resp.headers["Location"]
-        resp = session.get(redirect_url, allow_redirects=False, stream=True, timeout=120)
-        hops += 1
+    wait = 4
+    for attempt in range(max_retries):
+        local_path.unlink(missing_ok=True)
+        try:
+            resp = session.get(
+                url, allow_redirects=False, stream=True,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
 
-    if resp.status_code in (301, 302, 303, 307, 308):
-        raise RuntimeError(f"Too many redirects for {label}")
+            # Follow redirects manually to keep Authorization header
+            hops = 0
+            while resp.status_code in (301, 302, 303, 307, 308) and hops < 5:
+                redirect_url = resp.headers["Location"]
+                resp = session.get(
+                    redirect_url, allow_redirects=False, stream=True,
+                    timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                )
+                hops += 1
 
-    resp.raise_for_status()
-    total = int(resp.headers.get("Content-Length", 0))
+            if resp.status_code in (301, 302, 303, 307, 308):
+                raise RuntimeError(f"Too many redirects for {label}")
 
-    with open(local_path, "wb") as fh:
-        with tqdm(
-            total=total or None,
-            unit="B",
-            unit_scale=True,
-            desc=label,
-            leave=False,
-        ) as pbar:
-            for chunk in resp.iter_content(chunk_size=256 * 1024):
-                fh.write(chunk)
-                pbar.update(len(chunk))
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length", 0))
+
+            with open(local_path, "wb") as fh:
+                with tqdm(
+                    total=total or None,
+                    unit="B",
+                    unit_scale=True,
+                    desc=label,
+                    leave=False,
+                ) as pbar:
+                    for chunk in resp.iter_content(chunk_size=256 * 1024):
+                        fh.write(chunk)
+                        pbar.update(len(chunk))
+            return  # success
+
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            logger.warning(
+                "Download stalled for %s (attempt %d/%d): %s — retrying in %ds",
+                label, attempt + 1, max_retries, exc, wait,
+            )
+            time.sleep(wait)
+            wait = min(wait * 2, 120)
+
+    raise RuntimeError(f"Download failed after {max_retries} attempts: {label}")
