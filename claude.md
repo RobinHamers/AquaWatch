@@ -285,9 +285,13 @@ Default reservoir is `serre_poncon` (backward-compatible with all pre-Weekend 6 
 - Serre-Ponçon (France, 28 km², EPSG:32631): 2/2 bloom periods validated, 5 false positives
 - Entrepeñas (Spain, 80 km², EPSG:32630) — SIMULATION: 2/2 validated (synthetic data, peaks 0.38–0.43)
 - Entrepeñas — REAL DATA (115 real S2 scenes, 2022–2023): max NDCI 0.026, 1/2 bloom periods validated
-  - NDCI signal is ~20× weaker than Serre-Ponçon; CHT-reported blooms not detectable by NDCI
-  - Likely cause: different dominant species, deeper/mixed reservoir, or blooms in shallow bays outside polygon
-  - Conclusion: methodology does NOT generalise to Entrepeñas with current thresholds — site-specific calibration required
+  - NDCI is NEGATIVE across the main reservoir body (B04 > B05) — sediment/DOC dominated optical signal
+  - Turbidity proxy flat at 0.74-0.88 all year (no seasonal bloom enhancement)
+  - Weak positive NDCI (0.02-0.04) only in narrow tributary arms (<5% of surface)
+  - Spatial analysis: outputs/demo/entrepenhas_spatial_analysis.png
+  - Root cause: sediment/DOC overwhelms phytoplankton spectral signal at B04/B05
+  - Alternatives: Sentinel-3 OLCI (620nm phycocyanin band), turbidity-corrected index, targeted tributary polygons
+  - Conclusion: NDCI from S2 B04/B05 requires optically clear reservoir — does NOT work for turbid/sediment-dominated systems
 
 **Known processing environment requirements:**
 - `s3_interp` conda env: for `process` step (needs working PROJ — ml_env has PROJ db version conflict)
