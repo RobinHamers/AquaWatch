@@ -358,7 +358,11 @@ def print_validation_report(
         period_df = df.loc[mask]
         if not period_df.empty and _NDCI_MEAN in period_df.columns:
             max_idx = period_df[_NDCI_MEAN].idxmax()
-            max_ndci = period_df.loc[max_idx, _NDCI_MEAN]
+            if hasattr(max_idx, "__len__"):  # Series returned when duplicates exist
+                max_idx = max_idx.iloc[0]
+            max_ndci = float(period_df.loc[max_idx, _NDCI_MEAN].iloc[0]
+                             if hasattr(period_df.loc[max_idx, _NDCI_MEAN], "iloc")
+                             else period_df.loc[max_idx, _NDCI_MEAN])
             max_date = max_idx.date() if hasattr(max_idx, "date") else max_idx
         else:
             max_ndci = float("nan")

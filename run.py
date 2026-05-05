@@ -192,6 +192,7 @@ def cmd_process(args) -> None:
                 band_paths={k: v for k, v in jp2s.items()},
                 scl_path=scl_path,
                 output_dir=masked_dir,
+                fallback_crs=cfg["epsg"],
             )
             masked["SCL"] = scl_path
             clip_to_reservoir(
@@ -199,6 +200,7 @@ def cmd_process(args) -> None:
                 reservoir_geojson=cfg["geojson"],
                 output_dir=clipped_dir,
                 target_crs=cfg["epsg"],
+                fallback_crs=cfg["epsg"],
             )
             logger.info("Processed %s", scene_id[:50])
         except Exception:

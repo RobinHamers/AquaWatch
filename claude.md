@@ -283,9 +283,16 @@ Default reservoir is `serre_poncon` (backward-compatible with all pre-Weekend 6 
 
 **Generalisation validation (Weekend 6):**
 - Serre-Ponçon (France, 28 km², EPSG:32631): 2/2 bloom periods validated, 5 false positives
-- Entrepeñas (Spain, 80 km², EPSG:32630): 2/2 bloom periods validated, 14 false positives
-- Combined: 4/4 bloom periods, 19/47 total alerts outside bloom season (all LOW)
-- Thresholds retuned: NO — same LOW=0.20, MEDIUM=0.30, HIGH=0.40, z=1.5σ, min_pixels=40%
+- Entrepeñas (Spain, 80 km², EPSG:32630) — SIMULATION: 2/2 validated (synthetic data, peaks 0.38–0.43)
+- Entrepeñas — REAL DATA (115 real S2 scenes, 2022–2023): max NDCI 0.026, 1/2 bloom periods validated
+  - NDCI signal is ~20× weaker than Serre-Ponçon; CHT-reported blooms not detectable by NDCI
+  - Likely cause: different dominant species, deeper/mixed reservoir, or blooms in shallow bays outside polygon
+  - Conclusion: methodology does NOT generalise to Entrepeñas with current thresholds — site-specific calibration required
+
+**Known processing environment requirements:**
+- `s3_interp` conda env: for `process` step (needs working PROJ — ml_env has PROJ db version conflict)
+- `ml_env` conda env: for `timeseries`, `alerts`, `maps` (needs matplotlib — s3_interp missing cycler)
+- JP2 CRS fallback: ml_env's GDAL JP2 driver doesn't embed CRS in JP2 metadata; fixed via `fallback_crs=cfg["epsg"]` in `apply_cloud_mask()` and `clip_to_reservoir()`
 
 ## Weekend 7+ Ideas
 - Email/webhook notification when `check_new_scene()` fires

@@ -27,6 +27,7 @@ def apply_cloud_mask(
     band_paths: dict[str, Path],
     scl_path: Path,
     output_dir: Path,
+    fallback_crs: str | None = None,
 ) -> dict[str, Path]:
     """Apply SCL-based cloud mask to all bands.
 
@@ -38,6 +39,8 @@ def apply_cloud_mask(
     band_paths : mapping of band name → JP2 file path (excludes SCL)
     scl_path : path to the SCL band JP2
     output_dir : directory for masked output files
+    fallback_crs : CRS string (e.g. "EPSG:32630") used when JP2 metadata
+        lacks an embedded CRS (common with some GDAL JP2 drivers)
 
     Returns
     -------
@@ -49,7 +52,7 @@ def apply_cloud_mask(
     with rasterio.open(scl_path) as src:
         scl = src.read(1)
         scl_transform = src.transform
-        scl_crs = src.crs
+        scl_crs = src.crs or (CRS.from_string(fallback_crs) if fallback_crs else None)
         scl_shape = src.shape
 
     valid_mask = ~np.isin(scl, list(INVALID_SCL_CLASSES))
@@ -67,6 +70,8 @@ def apply_cloud_mask(
             data = src.read(1).astype(np.float32)
             profile = src.profile.copy()
             band_transform = src.transform
+        if profile.get("crs") is None and fallback_crs:
+            profile["crs"] = CRS.from_string(fallback_crs)
 
         # Resample validity mask to band pixel grid if resolutions differ
         if data.shape != scl_shape:
@@ -103,6 +108,7 @@ def clip_to_reservoir(
     reservoir_geojson: Path,
     output_dir: Path,
     target_crs: str = "EPSG:32632",
+    fallback_crs: str | None = None,
 ) -> dict[str, Path]:
     """Clip all bands to the reservoir extent and resample 20m bands to 10m.
 
@@ -129,6 +135,8 @@ def clip_to_reservoir(
     first_path = next(iter(band_paths.values()))
     with rasterio.open(first_path) as src:
         actual_crs = src.crs
+    if actual_crs is None:
+        actual_crs = CRS.from_string(fallback_crs or target_crs)
     actual_epsg = actual_crs.to_epsg()
     if actual_epsg != int(target_crs.split(":")[1]):
         logger.info(
